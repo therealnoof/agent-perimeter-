@@ -143,3 +143,36 @@ func TestSensitivityFloorRange(t *testing.T) {
 		t.Fatalf("got %v, want ErrInvalid", err)
 	}
 }
+
+// resource_arg must point at a bounded string field; free text would become
+// a policy entity id.
+func TestResourceArgMustBeBounded(t *testing.T) {
+	mk := func(prop string) string {
+		return `{"role":"r","data_clearance":"x","max_delegation_depth":0,"tools":[{"name":"t","kind":"structured","direction":"outbound","resource_arg":"target","args_schema":{"type":"object","properties":{"target":` + prop + `},"required":["target"]}}]}`
+	}
+	good := []string{
+		`{"type":"string","enum":["a","b"]}`,
+		`{"type":"string","pattern":"^[A-Z]+-[0-9]+$"}`,
+	}
+	bad := []string{
+		`{"type":"string","maxLength":200}`, // free text, just short
+		`{"type":"integer"}`,
+	}
+	for _, p := range good {
+		path, pub := writeSigned(t, t.TempDir(), mk(p))
+		if _, err := Load(path, pub); err != nil {
+			t.Errorf("bounded %s rejected: %v", p, err)
+		}
+	}
+	for _, p := range bad {
+		path, pub := writeSigned(t, t.TempDir(), mk(p))
+		if _, err := Load(path, pub); !errors.Is(err, ErrInvalid) {
+			t.Errorf("unbounded %s accepted", p)
+		}
+	}
+	// Undeclared field.
+	path, pub := writeSigned(t, t.TempDir(), `{"role":"r","data_clearance":"x","max_delegation_depth":0,"tools":[{"name":"t","kind":"structured","direction":"outbound","resource_arg":"nope","args_schema":{"type":"object","properties":{}}}]}`)
+	if _, err := Load(path, pub); !errors.Is(err, ErrInvalid) {
+		t.Error("undeclared resource_arg accepted")
+	}
+}

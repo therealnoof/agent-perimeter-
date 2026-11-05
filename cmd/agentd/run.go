@@ -14,6 +14,7 @@ import (
 	"os/user"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -41,6 +42,7 @@ type response struct {
 type governor struct {
 	man     *manifest.Manifest
 	schemas map[string]*schema.Schema // compiled per tool at startup
+	engine  *policy.Engine            // signed Cedar policies, loaded at startup
 	tasks   *taskstate.Store
 	log     *audit.Writer
 	user    string // originating_user for every audit record
@@ -52,6 +54,7 @@ func cmdRun(args []string) error {
 	manifestPath := fs.String("manifest", "", "signed manifest (JSON); its .sig must sit beside it")
 	pubkeyPath := fs.String("pubkey", "", "hex Ed25519 public key that signed the manifest")
 	auditPath := fs.String("audit", "", "audit chain to append to")
+	policyDir := fs.String("policies", "policies", "directory of signed *.cedar policy files")
 	workerUID := fs.Int("worker-uid", -1, "UID the worker is expected to run as (default: this process's UID)")
 	workerUser := fs.String("worker-user", "", "run the worker AS this user (requires agentd to start as root); implies -worker-uid")
 	dryRun := fs.Bool("dry-run", false, "log verdicts but execute anyway (P-5)")
@@ -83,6 +86,12 @@ func cmdRun(args []string) error {
 			return fmt.Errorf("refusing to start: tool %q: %w", t.Name, err)
 		}
 		schemas[t.Name] = sc
+	}
+
+	// --- P-1: policies are signed with the same key and verified the same way. ---
+	engine, err := policy.Load(*policyDir, pub)
+	if err != nil {
+		return fmt.Errorf("refusing to start: %w", err)
 	}
 
 	uid := uint32(os.Getuid())
@@ -127,9 +136,10 @@ func cmdRun(args []string) error {
 	}
 	defer log.Close()
 
-	g := &governor{man: man, schemas: schemas, tasks: taskstate.New(), log: log, user: me, dryRun: *dryRun}
+	g := &governor{man: man, schemas: schemas, engine: engine, tasks: taskstate.New(), log: log, user: me, dryRun: *dryRun}
 
-	g.record(audit.Record{Event: "start", Detail: fmt.Sprintf("manifest=%s worker_uid=%d dry_run=%v", filepath.Base(*manifestPath), uid, *dryRun)})
+	g.record(audit.Record{Event: "start", Detail: fmt.Sprintf("manifest=%s policies=%s worker_uid=%d dry_run=%v",
+		filepath.Base(*manifestPath), strings.Join(engine.Files(), ","), uid, *dryRun)})
 
 	// --- G-2: spawn the worker with its end of the socketpair on fd 3. ---
 	cmd := exec.Command(workerCmd[0], workerCmd[1:]...)
@@ -236,14 +246,17 @@ func (g *governor) handle(raw []byte) response {
 	}
 
 	// Build the policy input from the manifest and task store. Note what is
-	// absent: req.Justification is never read.
+	// absent: req.Justification is never read, and req.Args contributes only
+	// its hash and (if the tool declares one) its bounded resource argument.
 	_, depth := g.tasks.Delegation(req.TaskID)
 	taint := g.tasks.TaintHWM(req.TaskID)
 	in := policy.Input{
 		Role:               g.man.Role,
+		DataClearance:      g.man.DataClearance,
 		MaxDelegationDepth: g.man.MaxDelegationDepth,
 		ToolKnown:          tool != nil,
 		ToolName:           req.Tool,
+		Target:             policy.NoTarget,
 		CallCount:          g.tasks.Count(req.TaskID, req.Tool),
 		TaintHWM:           taint,
 		DelegationDepth:    depth,
@@ -254,8 +267,14 @@ func (g *governor) handle(raw []byte) response {
 		in.ToolDirection = tool.Direction
 		in.SensitivityFloor = tool.SensitivityFloor
 		in.MaxCallsPerTask = tool.MaxCallsPerTask
+		if tool.ResourceArg != "" {
+			// Safe to read: the manifest loader proved this field is an
+			// enum- or pattern-bounded string, and the schema validator just
+			// proved this value satisfies it.
+			in.Target = stringArg(req.Args, tool.ResourceArg)
+		}
 	}
-	d := policy.Decide(in)
+	d := g.engine.Decide(in)
 
 	g.record(audit.Record{
 		Event: "verdict", TaskID: req.TaskID, Tool: req.Tool,
@@ -277,10 +296,17 @@ func (g *governor) handle(raw []byte) response {
 		}
 	}
 
-	// Allowed (or dry-run). Count it, then run it.
+	// Allowed (or dry-run). Count it, run it, then raise taint by what the
+	// tool's SOURCE is declared to return (D-2). The content is never
+	// inspected; a confidential ticket read is confidential whether or not
+	// the agent later reformats it.
 	g.tasks.RecordAllow(req.TaskID, req.Tool)
 	result, exit := g.execute(req)
-	g.record(audit.Record{Event: "executor", TaskID: req.TaskID, Tool: req.Tool, ArgsHash: argsHash, ExitCode: &exit, Detail: "stub"})
+	newTaint := taint
+	if tool != nil && tool.ResultSensitivity > 0 && exit == 0 {
+		newTaint = g.tasks.RaiseTaint(req.TaskID, tool.ResultSensitivity)
+	}
+	g.record(audit.Record{Event: "executor", TaskID: req.TaskID, Tool: req.Tool, ArgsHash: argsHash, ExitCode: &exit, TaintHWM: &newTaint, Detail: "stub"})
 	return response{Verdict: "allow", Result: result}
 }
 
@@ -342,6 +368,20 @@ func minimalEnv() []string {
 		"PERIMETER_FD=" + strconv.Itoa(socket.WorkerFD),
 		"PYTHONUNBUFFERED=1",
 	}
+}
+
+// stringArg returns args[field] if it is a string, else "". Only called for a
+// field the manifest declared as resource_arg and the schema already validated.
+func stringArg(raw json.RawMessage, field string) string {
+	var m map[string]json.RawMessage
+	if json.Unmarshal(raw, &m) != nil {
+		return ""
+	}
+	var v string
+	if json.Unmarshal(m[field], &v) != nil {
+		return ""
+	}
+	return v
 }
 
 // canonical re-encodes JSON with sorted keys and no whitespace so that the

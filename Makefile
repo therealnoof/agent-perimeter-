@@ -4,13 +4,17 @@
 # Run `make help` for the list.
 
 GO        ?= go
+# -mod=vendor: build from the committed vendor/ directory, never the network.
+# This is how the air-gapped build works too.
+export GOFLAGS := -mod=vendor
 BIN       := bin
 KEYDIR    := keys
 PRIVKEY   := $(KEYDIR)/private/manifest-signing.key
 PUBKEY    := $(KEYDIR)/manifest-signing.pub
 MANIFESTS := $(wildcard manifests/*.json)
+POLICIES  := $(wildcard policies/*.cedar)
 
-.PHONY: help build test gen-key sign-manifests verify-manifests clean demo-week1
+.PHONY: help build test gen-key sign-manifests sign-policies sign verify-manifests verify-policies verify clean demo-week1 demo-week2
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-18s %s\n", $$1, $$2}'
@@ -34,6 +38,20 @@ sign-manifests: build ## Sign every manifests/*.json, writing a detached .sig be
 		$(BIN)/sign-manifest sign -priv $(PRIVKEY) -in $$m -out $$m.sig && echo "signed $$m"; \
 	done
 
+sign-policies: build ## Sign every policies/*.cedar, writing a detached .sig beside each
+	@for p in $(POLICIES); do \
+		$(BIN)/sign-manifest sign -priv $(PRIVKEY) -in $$p -out $$p.sig && echo "signed $$p"; \
+	done
+
+sign: sign-manifests sign-policies ## Sign manifests and policies
+
+verify-policies: build ## Verify every policy signature against the committed public key
+	@for p in $(POLICIES); do \
+		$(BIN)/sign-manifest verify -pub $(PUBKEY) -in $$p -sig $$p.sig && echo "ok      $$p"; \
+	done
+
+verify: verify-manifests verify-policies ## Verify manifests and policies
+
 verify-manifests: build ## Verify every manifest signature against the committed public key
 	@for m in $(MANIFESTS); do \
 		$(BIN)/sign-manifest verify -pub $(PUBKEY) -in $$m -sig $$m.sig && echo "ok      $$m"; \
@@ -46,6 +64,15 @@ demo-week1: build ## Run agentd with the stub Python worker and show the audit c
 	@cat run/audit.jsonl
 	@echo "--- verify ---"
 	$(BIN)/agentd verify -audit run/audit.jsonl
+
+demo-week2: build ## Staged-exfiltration demo: read confidential, then an ordinary update needs a human
+	@mkdir -p run
+	$(BIN)/agentd run -manifest manifests/stub-agent.json -pubkey $(PUBKEY) -audit run/audit2.jsonl -- python3 agents/stub_worker.py --week2
+	@echo "--- verdicts ---"
+	@grep -o '"tool":"[a-z_]*","verdict":"[a-z]*","rule_fired":"[^"]*"' run/audit2.jsonl
+	@echo "--- taint ---"
+	@grep -o '"event":"executor".*"taint_hwm":[0-9]*' run/audit2.jsonl | grep -o '"tool":"[a-z_]*".*taint_hwm":[0-9]*'
+	$(BIN)/agentd verify -audit run/audit2.jsonl
 
 clean: ## Remove build outputs and runtime state
 	rm -rf $(BIN) run

@@ -48,6 +48,19 @@ type Tool struct {
 	// Enforced by the governor (G-7), never by a token. 0 means no cap.
 	MaxCallsPerTask int `json:"max_calls_per_task,omitempty"`
 
+	// ResourceArg names the args field whose value becomes the Cedar
+	// `resource` (Target::"<value>") so policy can say "this channel but not
+	// that one". The field's schema must be a string bounded by enum or
+	// pattern, so an agent cannot put free text into an entity id. Empty
+	// means the tool has no resource dimension.
+	ResourceArg string `json:"resource_arg,omitempty"`
+
+	// ResultSensitivity (0-10) is the sensitivity of data this tool RETURNS.
+	// When the tool runs, the governor raises the task's taint high-water
+	// mark to at least this level (D-2). Determined by the source, never by
+	// inspecting the content. 0 means the result carries no sensitivity.
+	ResultSensitivity int `json:"result_sensitivity,omitempty"`
+
 	// ArgsSchema constrains the "args" object the agent sends. See
 	// internal/schema for the subset of JSON Schema we support.
 	ArgsSchema json.RawMessage `json:"args_schema"`
@@ -132,6 +145,31 @@ func LoadPublicKey(path string) (ed25519.PublicKey, error) {
 	return ed25519.PublicKey(key), nil
 }
 
+// boundedStringField checks that the args schema declares `field` as a string
+// constrained by an enum or a pattern. It looks only at the shape it needs.
+func boundedStringField(schemaRaw json.RawMessage, field string) error {
+	var s struct {
+		Properties map[string]struct {
+			Type    string            `json:"type"`
+			Enum    []json.RawMessage `json:"enum"`
+			Pattern string            `json:"pattern"`
+		} `json:"properties"`
+	}
+	if err := json.Unmarshal(schemaRaw, &s); err != nil {
+		return fmt.Errorf("schema not readable: %v", err)
+	}
+	p, ok := s.Properties[field]
+	switch {
+	case !ok:
+		return errors.New("not a declared property")
+	case p.Type != "string":
+		return errors.New("must be type string")
+	case len(p.Enum) == 0 && p.Pattern == "":
+		return errors.New("must be bounded by enum or pattern")
+	}
+	return nil
+}
+
 // parse decodes and sanity-checks manifest bytes that have already been
 // signature-verified. It is strict: unknown fields are an error, because a
 // typo in a manifest should fail loudly rather than silently grant or deny.
@@ -177,6 +215,17 @@ func parse(raw []byte) (*Manifest, error) {
 		}
 		if len(t.ArgsSchema) == 0 {
 			return nil, fmt.Errorf("%w: tool %q: args_schema is required", ErrInvalid, t.Name)
+		}
+		if t.ResultSensitivity < 0 || t.ResultSensitivity > 10 {
+			return nil, fmt.Errorf("%w: tool %q: result_sensitivity must be 0-10", ErrInvalid, t.Name)
+		}
+		if t.ResourceArg != "" {
+			// The resource arg must be a bounded string, because its value
+			// becomes a policy entity id. This is checked structurally against
+			// the raw schema here; the schema package re-validates at runtime.
+			if err := boundedStringField(t.ArgsSchema, t.ResourceArg); err != nil {
+				return nil, fmt.Errorf("%w: tool %q: resource_arg %q: %v", ErrInvalid, t.Name, t.ResourceArg, err)
+			}
 		}
 	}
 	return &m, nil

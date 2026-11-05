@@ -17,9 +17,24 @@
       }
     },
     {
+      "name": "jira_read",
+      "kind": "structured",
+      "direction": "inbound",
+      "resource_arg": "ticket_id",
+      "result_sensitivity": 8,
+      "args_schema": {
+        "type": "object",
+        "properties": {
+          "ticket_id": {"type": "string", "pattern": "^[A-Z]+-[0-9]+$"}
+        },
+        "required": ["ticket_id"]
+      }
+    },
+    {
       "name": "jira_update",
       "kind": "structured",
       "direction": "outbound",
+      "resource_arg": "ticket_id",
       "sensitivity_floor": 7,
       "args_schema": {
         "type": "object",
@@ -34,10 +49,11 @@
       "name": "slack_post",
       "kind": "freeform",
       "direction": "outbound",
+      "resource_arg": "channel",
       "args_schema": {
         "type": "object",
         "properties": {
-          "channel": {"type": "string", "enum": ["#triage-internal"]},
+          "channel": {"type": "string", "enum": ["#triage-internal", "#general"]},
           "text": {"type": "string", "maxLength": 2000}
         },
         "required": ["channel", "text"]

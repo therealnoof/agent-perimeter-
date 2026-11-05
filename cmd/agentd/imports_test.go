@@ -28,6 +28,11 @@ func TestNoForbiddenImports(t *testing.T) {
 		"anthropic", "openai", "langchain", "llm", "genai", "gemini", "ollama", "bedrock", "vertex",
 		"grpc", "github.com/", // the governor is stdlib-only by decision; any module import is a red flag
 	}
+	// The one sanctioned exception: the Cedar policy engine, and only from
+	// internal/policy. Anywhere else it is still a failure.
+	allowedModuleIn := map[string]string{
+		"github.com/cedar-policy/cedar-go": "internal/policy/",
+	}
 
 	roots := []string{".", "../../internal"}
 	fset := token.NewFileSet()
@@ -56,6 +61,15 @@ func TestNoForbiddenImports(t *testing.T) {
 						continue
 					}
 					t.Errorf("%s imports %q: %s", path, p, why)
+				}
+				allowed := false
+				for mod, where := range allowedModuleIn {
+					if strings.HasPrefix(p, mod) && strings.Contains(filepath.ToSlash(path), where) {
+						allowed = true
+					}
+				}
+				if allowed {
+					continue
 				}
 				lp := strings.ToLower(p)
 				for _, s := range forbiddenSubstr {
