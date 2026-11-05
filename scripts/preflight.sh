@@ -58,6 +58,19 @@ else
   warn "not root: worker will run as your own uid; the UID boundary is not exercised"
 fi
 
+# Can the worker account actually reach the code? Home directories are 750 on
+# Ubuntu 24.04 and most current distributions, which makes this the most
+# common first-run failure. Test it the way agentd will: as that user.
+if [ "$(id -u)" -eq 0 ] && id perimeter-worker >/dev/null 2>&1; then
+  repo=$(cd "$(dirname "$0")/.." && pwd)
+  if sudo -u perimeter-worker test -r "$repo/agents/stub_worker.py" \
+     && sudo -u perimeter-worker test -r "$repo/client/perimeter_client/__init__.py"; then
+    pass "perimeter-worker can read $repo/agents and client/"
+  else
+    fail "perimeter-worker cannot read $repo (home dir is probably 750). Run: chmod o+x \"\$HOME\"  or move the repo to /opt. See DEPLOY.md step 3."
+  fi
+fi
+
 # The overflow uid is what an unmapped sender looks like; we refuse it, so the
 # worker account must not be it.
 if id perimeter-worker >/dev/null 2>&1 && [ "$(id -u perimeter-worker)" -eq 65534 ]; then
