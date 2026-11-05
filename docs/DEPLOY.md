@@ -4,6 +4,16 @@ How to put `agentd` on a fresh Linux host and prove it is working. Every command
 
 The guide assumes you are deploying to **one host** that will run the governor, the worker, and (from week 3) the executors. Nothing needs the internet after step 2.
 
+## 0. Get a proper root shell
+
+Most steps below run as root. Use a **login** shell so `$HOME` is set:
+
+```bash
+sudo -i          # or: sudo su -
+```
+
+`sudo -s` and plain `sudo su` leave `$HOME` unset, which breaks `git` global config and `gh auth setup-git` (`fatal: $HOME not set`) and causes git to prompt for a password that GitHub will never accept. If you are already in such a shell, `export HOME=/root` fixes it for that session.
+
 ## 1. Host requirements
 
 | Need | Minimum | Why |
@@ -220,4 +230,6 @@ No Go toolchain is needed on the target. **(week 2)** will add `go mod vendor` f
 | Worker prints nothing, governor exits with `request loop error ... sender UID does not match` | `-worker-uid` disagrees with the actual worker UID | Use `-worker-user` and let agentd set both |
 | `python3: can't open file .../stub_worker.py: Permission denied` | Worker account cannot traverse the repo path | `chmod o+x` on the parent directories, or move the repo to `/opt` |
 | `audit: chain broken at record N` on start | Existing audit file was edited or truncated | Start a new file; keep the broken one as evidence |
+| `git push` asks for a password and rejects it | GitHub does not accept account passwords over HTTPS | `gh auth login` then `gh auth setup-git`, or a fine-grained token as the password, or switch the remote to SSH |
+| `fatal: $HOME not set` from git or gh | Non-login root shell (`sudo -s`, `sudo su`) | `export HOME=/root`, or re-enter with `sudo -i` |
 | `agentd verify` says `ok` but you expected a break | You edited a record's whitespace only | The hash covers the exact bytes; a whitespace edit does change it, so re-check the file you verified is the one you edited |
