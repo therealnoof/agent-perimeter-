@@ -43,11 +43,23 @@ sudo useradd --system --no-create-home --shell /usr/sbin/nologin perimeter-worke
 id perimeter-worker          # note the uid; it must not be 65534
 ```
 
-The worker needs read access to the client library and its own script. The repo's default permissions allow this; if you cloned into a home directory with `700` permissions, either move the repo or:
+**You will almost certainly hit a permissions problem here.** Ubuntu 24.04 (and most recent distributions) create home directories as `750`, so a repo cloned under `/home/<you>` cannot be reached by `perimeter-worker`, and step 6 fails with `python3: can't open file '.../agents/stub_worker.py': Permission denied`. Choose one:
 
 ```bash
-chmod o+x "$HOME"           # lets other users traverse, not list
+# Option A (lab box): let other users traverse your home directory. They still cannot list it.
+chmod o+x "$HOME"
+
+# Option B (anything you will demo from): put the code where the agent's user can reach it.
+sudo mv ~/agent-perimeter /opt/agent-perimeter && cd /opt/agent-perimeter
 ```
+
+Then confirm the worker account can actually read what it needs:
+
+```bash
+sudo -u perimeter-worker python3 -c "import sys; sys.path.insert(0,'client'); import perimeter_client; print('worker can read the client library')"
+```
+
+If that fails, `namei -l agents/stub_worker.py` shows which directory on the path is missing `x` for others; `chmod -R o+rX agents client` fixes the files themselves if a restrictive `umask` left them `600`.
 
 ## 4. Signing key and manifests
 
@@ -107,7 +119,8 @@ Flags:
 Expected output ends with the worker's eight lines and the governor returning to the prompt. Then:
 
 ```bash
-bin/agentd verify -audit /var/lib/agent-perimeter/audit/<file>.jsonl
+# verify the chain you just wrote (the newest file in the audit directory)
+bin/agentd verify -audit "$(ls -t /var/lib/agent-perimeter/audit/*.jsonl | head -1)"
 # ok: 13 records, chain intact
 ```
 
@@ -129,7 +142,7 @@ grep -o '"detail":"request loop error[^"]*"' /tmp/wrong.jsonl
 # "detail":"request loop error, worker killed: socket: sender UID does not match the worker: got 0, want 4242"
 
 # S-3: tamper detection
-cp /var/lib/agent-perimeter/audit/<file>.jsonl /tmp/t.jsonl
+cp "$(ls -t /var/lib/agent-perimeter/audit/*.jsonl | head -1)" /tmp/t.jsonl
 sed -i '4s/"allow"/"deny"/' /tmp/t.jsonl
 bin/agentd verify -audit /tmp/t.jsonl
 # agentd: audit: chain broken at record 5: prev_hash does not match previous record
