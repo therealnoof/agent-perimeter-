@@ -1,0 +1,23 @@
+# Build outputs
+/bin/
+/dist/
+
+# Signing keys never live in the repo. The public key is committed under keys/;
+# the private key stays on the signer's machine.
+*.key
+/keys/private/
+
+# Runtime state
+/run/
+*.jsonl
+!harness/fixtures/*.jsonl
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Editors
+.idea/
+.vscode/
+*.swp

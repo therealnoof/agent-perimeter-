@@ -1,0 +1,47 @@
+{
+  "role": "stub-agent",
+  "data_clearance": "internal",
+  "max_delegation_depth": 0,
+  "tools": [
+    {
+      "name": "echo",
+      "kind": "structured",
+      "direction": "inbound",
+      "max_calls_per_task": 3,
+      "args_schema": {
+        "type": "object",
+        "properties": {
+          "msg": {"type": "string", "maxLength": 200}
+        },
+        "required": ["msg"]
+      }
+    },
+    {
+      "name": "jira_update",
+      "kind": "structured",
+      "direction": "outbound",
+      "sensitivity_floor": 7,
+      "args_schema": {
+        "type": "object",
+        "properties": {
+          "ticket_id": {"type": "string", "pattern": "^[A-Z]+-[0-9]+$"},
+          "status": {"type": "string", "enum": ["open", "closed"]}
+        },
+        "required": ["ticket_id", "status"]
+      }
+    },
+    {
+      "name": "slack_post",
+      "kind": "freeform",
+      "direction": "outbound",
+      "args_schema": {
+        "type": "object",
+        "properties": {
+          "channel": {"type": "string", "enum": ["#triage-internal"]},
+          "text": {"type": "string", "maxLength": 2000}
+        },
+        "required": ["channel", "text"]
+      }
+    }
+  ]
+}
