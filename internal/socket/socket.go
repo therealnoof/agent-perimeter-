@@ -20,8 +20,9 @@ const WorkerFD = 3
 
 // Errors callers can test for.
 var (
-	ErrPeerUID      = errors.New("socket: peer UID does not match the worker")
-	ErrOverflowUID  = errors.New("socket: peer UID is the overflow UID (unmapped)")
+	ErrPeerUID      = errors.New("socket: sender UID does not match the worker")
+	ErrOverflowUID  = errors.New("socket: sender UID is the overflow UID (unmapped)")
+	ErrNoCreds      = errors.New("socket: message carried no kernel credentials")
 	ErrFrameTooBig  = errors.New("socket: frame length exceeds limit")
 	ErrFrameTooTiny = errors.New("socket: zero-length frame")
 )
@@ -29,28 +30,38 @@ var (
 // Pair is the governor's end of a socketpair plus the worker that holds the
 // other end.
 type Pair struct {
-	conn        *os.File // our end, wrapped for Read/Write
-	fd          int      // our end's raw fd, for getsockopt
+	fd          int
 	expectedUID uint32
 	maxFrame    uint32
 	Cmd         *exec.Cmd
 }
 
 // Spawn creates a socketpair, starts cmd with the worker end on fd 3, and
-// returns the governor's side. expectedUID is the UID the worker runs as, as
-// seen from our namespace; every frame's SO_PEERCRED must match it.
+// returns the governor's side. expectedUID is the UID the worker runs as;
+// every frame's kernel-attached sender credentials must match it.
+//
+// Why SO_PASSCRED and not SO_PEERCRED: SO_PEERCRED reports the credentials of
+// the process that CREATED the connection. For a socketpair that is always
+// the governor itself, even after the child calls setuid, so it proves
+// nothing. With SO_PASSCRED set on our end, the kernel attaches the actual
+// sender's uid/gid/pid to every message as SCM_CREDENTIALS ancillary data,
+// and a sender cannot forge it without CAP_SETUID. That is the property G-3
+// wants.
 //
 // The worker end is closed in our process immediately after the fork so that
 // EOF on our side means the worker (and all its children) are gone.
 func Spawn(cmd *exec.Cmd, expectedUID uint32, maxFrame uint32) (*Pair, error) {
-	// SOCK_SEQPACKET would give us message boundaries for free, but SOCK_STREAM
-	// plus a length prefix is what every language's stdlib can do without
-	// ceremony, and the Python client has to be trivial.
 	fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_STREAM|syscall.SOCK_CLOEXEC, 0)
 	if err != nil {
 		return nil, fmt.Errorf("socket: socketpair: %w", err)
 	}
 	ours, theirs := fds[0], fds[1]
+
+	if err := syscall.SetsockoptInt(ours, syscall.SOL_SOCKET, syscall.SO_PASSCRED, 1); err != nil {
+		syscall.Close(ours)
+		syscall.Close(theirs)
+		return nil, fmt.Errorf("socket: SO_PASSCRED: %w", err)
+	}
 
 	theirsFile := os.NewFile(uintptr(theirs), "worker-socket")
 	// ExtraFiles[0] lands on fd 3 in the child, regardless of its fd number here.
@@ -64,49 +75,21 @@ func Spawn(cmd *exec.Cmd, expectedUID uint32, maxFrame uint32) (*Pair, error) {
 	// We must not hold the worker's end, or we would never see EOF.
 	theirsFile.Close()
 
-	return &Pair{
-		conn:        os.NewFile(uintptr(ours), "governor-socket"),
-		fd:          ours,
-		expectedUID: expectedUID,
-		maxFrame:    maxFrame,
-		Cmd:         cmd,
-	}, nil
+	return &Pair{fd: ours, expectedUID: expectedUID, maxFrame: maxFrame, Cmd: cmd}, nil
 }
 
-// FromFD wraps an already-open socket fd as the governor side. Used by tests
-// that build their own socketpair without spawning a process.
-func FromFD(fd int, expectedUID uint32, maxFrame uint32) *Pair {
-	return &Pair{
-		conn:        os.NewFile(uintptr(fd), "governor-socket"),
-		fd:          fd,
-		expectedUID: expectedUID,
-		maxFrame:    maxFrame,
+// FromFD wraps an already-open socket fd as the governor side and enables
+// SO_PASSCRED on it. Used by tests that build their own socketpair.
+func FromFD(fd int, expectedUID uint32, maxFrame uint32) (*Pair, error) {
+	if err := syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_PASSCRED, 1); err != nil {
+		return nil, fmt.Errorf("socket: SO_PASSCRED: %w", err)
 	}
-}
-
-// PeerUID returns the UID of the process on the other end, via SO_PEERCRED.
-func (p *Pair) PeerUID() (uint32, error) {
-	ucred, err := syscall.GetsockoptUcred(p.fd, syscall.SOL_SOCKET, syscall.SO_PEERCRED)
-	if err != nil {
-		return 0, fmt.Errorf("socket: SO_PEERCRED: %w", err)
-	}
-	return ucred.Uid, nil
-}
-
-// checkPeer enforces G-3 on every frame. Checking per frame rather than once
-// at startup costs one getsockopt (microseconds) and means the check cannot
-// be bypassed by a later change of identity on the far end.
-func (p *Pair) checkPeer() error {
-	uid, err := p.PeerUID()
-	if err != nil {
-		return err
-	}
-	return classifyUID(uid, p.expectedUID)
+	return &Pair{fd: fd, expectedUID: expectedUID, maxFrame: maxFrame}, nil
 }
 
 // classifyUID is the whole G-3 decision in one pure function, so it can be
-// tested without a second user namespace. Overflow is checked first: even if
-// an operator misconfigured expectedUID to 65534, we still refuse.
+// tested without a second UID. Overflow is checked first: even if an operator
+// misconfigured expectedUID to 65534, we still refuse.
 func classifyUID(got, want uint32) error {
 	if got == OverflowUID {
 		return ErrOverflowUID
@@ -117,18 +100,71 @@ func classifyUID(got, want uint32) error {
 	return nil
 }
 
-// ReadFrame reads one length-prefixed frame after verifying the peer.
-// Returns io.EOF when the worker has closed its end.
-func (p *Pair) ReadFrame() ([]byte, error) {
-	if err := p.checkPeer(); err != nil {
-		return nil, err
+// recv reads up to len(buf) bytes with recvmsg and returns the bytes read and
+// the sender UID from the SCM_CREDENTIALS the kernel attached. n == 0 means
+// the peer closed.
+func (p *Pair) recv(buf []byte) (int, uint32, error) {
+	// Enough room for one SCM_CREDENTIALS message (12 bytes + header).
+	oob := make([]byte, syscall.CmsgSpace(12))
+	n, oobn, _, _, err := syscall.Recvmsg(p.fd, buf, oob, 0)
+	if err != nil {
+		return 0, 0, fmt.Errorf("socket: recvmsg: %w", err)
 	}
+	if n == 0 {
+		return 0, 0, nil
+	}
+	msgs, err := syscall.ParseSocketControlMessage(oob[:oobn])
+	if err != nil {
+		return n, 0, fmt.Errorf("socket: parse control message: %w", err)
+	}
+	for _, m := range msgs {
+		if m.Header.Level == syscall.SOL_SOCKET && m.Header.Type == syscall.SCM_CREDENTIALS {
+			cred, err := syscall.ParseUnixCredentials(&m)
+			if err != nil {
+				return n, 0, fmt.Errorf("socket: parse credentials: %w", err)
+			}
+			return n, cred.Uid, nil
+		}
+	}
+	// With SO_PASSCRED set the kernel always attaches credentials. If they
+	// are missing something is very wrong; refuse rather than guess.
+	return n, 0, ErrNoCreds
+}
+
+// readFull reads exactly len(buf) bytes, checking the sender credentials on
+// every message that arrives. Returns io.EOF if the peer closes before any
+// byte, io.ErrUnexpectedEOF if it closes mid-frame.
+func (p *Pair) readFull(buf []byte) error {
+	got := 0
+	for got < len(buf) {
+		n, uid, err := p.recv(buf[got:])
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			if got == 0 {
+				return io.EOF
+			}
+			return io.ErrUnexpectedEOF
+		}
+		if err := classifyUID(uid, p.expectedUID); err != nil {
+			return err
+		}
+		got += n
+	}
+	return nil
+}
+
+// ReadFrame reads one length-prefixed frame. Every message that makes up the
+// frame is credential-checked (G-3). Returns io.EOF when the worker has
+// closed its end.
+func (p *Pair) ReadFrame() ([]byte, error) {
 	var hdr [4]byte
-	if _, err := io.ReadFull(p.conn, hdr[:]); err != nil {
-		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+	if err := p.readFull(hdr[:]); err != nil {
+		if errors.Is(err, io.ErrUnexpectedEOF) {
 			return nil, io.EOF
 		}
-		return nil, fmt.Errorf("socket: read header: %w", err)
+		return nil, err
 	}
 	n := binary.BigEndian.Uint32(hdr[:])
 	// Check the length BEFORE allocating. An unchecked 0xFFFFFFFF here is a
@@ -140,7 +176,10 @@ func (p *Pair) ReadFrame() ([]byte, error) {
 		return nil, fmt.Errorf("%w: %d > %d", ErrFrameTooBig, n, p.maxFrame)
 	}
 	buf := make([]byte, n)
-	if _, err := io.ReadFull(p.conn, buf); err != nil {
+	if err := p.readFull(buf); err != nil {
+		if errors.Is(err, io.EOF) {
+			err = io.ErrUnexpectedEOF
+		}
 		return nil, fmt.Errorf("socket: read body: %w", err)
 	}
 	return buf, nil
@@ -153,11 +192,25 @@ func (p *Pair) WriteFrame(b []byte) error {
 	}
 	var hdr [4]byte
 	binary.BigEndian.PutUint32(hdr[:], uint32(len(b)))
-	if _, err := p.conn.Write(hdr[:]); err != nil {
+	if err := writeAll(p.fd, hdr[:]); err != nil {
 		return fmt.Errorf("socket: write header: %w", err)
 	}
-	if _, err := p.conn.Write(b); err != nil {
+	if err := writeAll(p.fd, b); err != nil {
 		return fmt.Errorf("socket: write body: %w", err)
+	}
+	return nil
+}
+
+func writeAll(fd int, b []byte) error {
+	for len(b) > 0 {
+		n, err := syscall.Write(fd, b)
+		if err != nil {
+			if err == syscall.EINTR {
+				continue
+			}
+			return err
+		}
+		b = b[n:]
 	}
 	return nil
 }
@@ -165,5 +218,5 @@ func (p *Pair) WriteFrame(b []byte) error {
 // Close shuts our end. If a worker was spawned, the caller is responsible for
 // waiting on or killing Cmd.
 func (p *Pair) Close() error {
-	return p.conn.Close()
+	return syscall.Close(p.fd)
 }

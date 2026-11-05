@@ -10,16 +10,19 @@ import (
 	"testing"
 )
 
-// localPair makes a socketpair inside this process. Both ends are us, so
-// SO_PEERCRED reports our own UID, which lets us test the happy path and the
-// UID-mismatch path without spawning anything.
+// localPair makes a socketpair inside this process. Both ends are us, so the
+// kernel stamps our own UID on every message, which lets us test the happy
+// path and the UID-mismatch path without spawning anything.
 func localPair(t *testing.T, expectUID uint32) (*Pair, *os.File) {
 	t.Helper()
 	fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_STREAM|syscall.SOCK_CLOEXEC, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	gov := FromFD(fds[0], expectUID, 1024)
+	gov, err := FromFD(fds[0], expectUID, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
 	worker := os.NewFile(uintptr(fds[1]), "worker")
 	t.Cleanup(func() { gov.Close(); worker.Close() })
 	return gov, worker
@@ -60,8 +63,8 @@ func TestRoundTrip(t *testing.T) {
 	}
 }
 
-// G-3: a peer whose UID is not the expected one is rejected before any byte
-// of the frame is read.
+// G-3: a sender whose UID is not the expected one is rejected on the very
+// first message, before the frame body is read.
 func TestWrongUIDRejected(t *testing.T) {
 	me := uint32(os.Getuid())
 	gov, worker := localPair(t, me+1) // expect someone else
@@ -72,9 +75,8 @@ func TestWrongUIDRejected(t *testing.T) {
 	}
 }
 
-// G-3: the overflow UID (an unmapped peer) is rejected even when it is,
-// absurdly, the expected UID. We cannot make the kernel report 65534 for our
-// own process, so the decision function is tested directly.
+// G-3: the overflow UID (an unmapped sender) is rejected even when it is,
+// absurdly, the expected UID. The decision function is tested directly.
 func TestOverflowUIDRejected(t *testing.T) {
 	if err := classifyUID(OverflowUID, OverflowUID); !errors.Is(err, ErrOverflowUID) {
 		t.Fatalf("overflow == expected: got %v, want ErrOverflowUID", err)
@@ -121,16 +123,15 @@ func TestEOFOnWorkerClose(t *testing.T) {
 	}
 }
 
-// G-2 end to end: spawn a real child that writes a frame on fd 3.
-func TestSpawnInheritsFD3(t *testing.T) {
-	// Python writes one frame on fd 3 and exits. If fd 3 were not the socket,
-	// this would fail or hang.
-	script := `
+const childScript = `
 import os, struct
 body = b'{"from":"child"}'
 os.write(3, struct.pack(">I", len(body)) + body)
 `
-	cmd := exec.Command("python3", "-c", script)
+
+// G-2 end to end: spawn a real child that writes a frame on fd 3.
+func TestSpawnInheritsFD3(t *testing.T) {
+	cmd := exec.Command("python3", "-c", childScript)
 	p, err := Spawn(cmd, uint32(os.Getuid()), 1024)
 	if err != nil {
 		t.Skipf("spawn: %v (python3 missing?)", err)
@@ -148,4 +149,36 @@ os.write(3, struct.pack(">I", len(body)) + body)
 		t.Errorf("after child exit: got %v, want EOF", err)
 	}
 	p.Cmd.Wait()
+}
+
+// G-3 with a REAL privilege drop. Only runs as root (needed to setuid the
+// child). The child runs as uid 12345; we expect 12345 and must accept, then
+// expect 12346 and must reject. This is the case SO_PEERCRED got wrong.
+func TestSpawnWithPrivilegeDrop(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("needs root to drop the child's privileges")
+	}
+	const childUID = 12345
+
+	run := func(expect uint32) error {
+		cmd := exec.Command("python3", "-c", childScript)
+		cmd.SysProcAttr = &syscall.SysProcAttr{
+			Credential: &syscall.Credential{Uid: childUID, Gid: childUID, NoSetGroups: true},
+		}
+		p, err := Spawn(cmd, expect, 1024)
+		if err != nil {
+			t.Fatalf("spawn: %v", err)
+		}
+		defer p.Close()
+		defer p.Cmd.Wait()
+		_, err = p.ReadFrame()
+		return err
+	}
+
+	if err := run(childUID); err != nil {
+		t.Fatalf("matching uid: got %v, want nil", err)
+	}
+	if err := run(childUID + 1); !errors.Is(err, ErrPeerUID) {
+		t.Fatalf("mismatched uid: got %v, want ErrPeerUID", err)
+	}
 }

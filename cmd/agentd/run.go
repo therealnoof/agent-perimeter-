@@ -52,7 +52,8 @@ func cmdRun(args []string) error {
 	manifestPath := fs.String("manifest", "", "signed manifest (JSON); its .sig must sit beside it")
 	pubkeyPath := fs.String("pubkey", "", "hex Ed25519 public key that signed the manifest")
 	auditPath := fs.String("audit", "", "audit chain to append to")
-	workerUID := fs.Int("worker-uid", -1, "UID the worker runs as (default: this process's UID)")
+	workerUID := fs.Int("worker-uid", -1, "UID the worker is expected to run as (default: this process's UID)")
+	workerUser := fs.String("worker-user", "", "run the worker AS this user (requires agentd to start as root); implies -worker-uid")
 	dryRun := fs.Bool("dry-run", false, "log verdicts but execute anyway (P-5)")
 	killDir := fs.String("kill-dir", "", "directory to watch; any file appearing there stops the worker (G-6)")
 	if err := fs.Parse(args); err != nil {
@@ -89,6 +90,31 @@ func cmdRun(args []string) error {
 		uid = uint32(*workerUID)
 	}
 
+	// -worker-user: look the account up and, if we are root, drop the worker
+	// to it. This is the week-1 stand-in for the week-4 container sandbox: it
+	// gives SO_PEERCRED something real to check (G-3) because the worker's UID
+	// now differs from the governor's.
+	var cred *syscall.Credential
+	if *workerUser != "" {
+		u, err := user.Lookup(*workerUser)
+		if err != nil {
+			return fmt.Errorf("run: -worker-user: %w", err)
+		}
+		wuid, _ := strconv.Atoi(u.Uid)
+		wgid, _ := strconv.Atoi(u.Gid)
+		if os.Getuid() != 0 {
+			return fmt.Errorf("run: -worker-user requires agentd to be started as root (to drop privileges for the worker)")
+		}
+		if wuid == 0 {
+			return fmt.Errorf("run: refusing to run the worker as root")
+		}
+		uid = uint32(wuid)
+		cred = &syscall.Credential{Uid: uint32(wuid), Gid: uint32(wgid), NoSetGroups: true}
+	}
+	if os.Getuid() == 0 && cred == nil {
+		fmt.Fprintln(os.Stderr, "agentd: WARNING: running as root with the worker also as root; use -worker-user for a real boundary")
+	}
+
 	// Who launched the governor. This is originating_user on every record (A-5).
 	me := "uid:" + strconv.Itoa(os.Getuid())
 	if u, err := user.Current(); err == nil && u.Username != "" {
@@ -112,7 +138,7 @@ func cmdRun(args []string) error {
 	cmd.Env = minimalEnv()
 	// Own process group so the kill switch can take down the worker and
 	// everything it forked in one signal.
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, Credential: cred}
 
 	pair, err := socket.Spawn(cmd, uid, schema.MaxFrameBytes)
 	if err != nil {
@@ -138,7 +164,12 @@ func cmdRun(args []string) error {
 		<-loopDone // the loop sees EOF once the worker is dead
 	case err = <-loopDone:
 		if err != nil {
-			g.record(audit.Record{Event: "stop", Detail: "request loop error: " + err.Error()})
+			// The loop stopped on a fatal error (an unauthenticated sender,
+			// most likely). The worker may be blocked waiting for a reply
+			// that will never come, so take the whole group down before
+			// Wait() or we deadlock.
+			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+			g.record(audit.Record{Event: "stop", Detail: "request loop error, worker killed: " + err.Error()})
 		}
 	}
 

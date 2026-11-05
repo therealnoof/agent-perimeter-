@@ -4,7 +4,11 @@ Per-action authorization for AI agents, enforced by a Go governor the agent cann
 
 `agentd` sits between an untrusted agent process and every tool it wants to call. The agent proposes an action over a single inherited socket; the governor validates it, decides against signed policy, runs it (or not), and records the outcome in a hash-chained audit log. The agent holds no credentials, has no network, and cannot influence the decision with anything it says.
 
-**Status: week 1 of 6.** The governor skeleton is complete and tested. See [`docs/PLAN.md`](docs/PLAN.md) for the full build plan (the plan document links the PRD).
+**Status: week 1 of 6.** The governor skeleton is complete and tested. Not yet demo-ready for a customer; see [`docs/TESTPLAN.md`](docs/TESTPLAN.md) for exactly what is proven and what is not.
+
+- [`docs/DEPLOY.md`](docs/DEPLOY.md) — fresh-host install, worker account, signing, run, smoke test
+- [`docs/TESTPLAN.md`](docs/TESTPLAN.md) — four test layers, manual integrity procedures, per-phase exit criteria
+- [`docs/PLAN.md`](docs/PLAN.md) — link to the living build plan and the deviations log
 
 ## What works today
 
@@ -12,7 +16,7 @@ Per-action authorization for AI agents, enforced by a Go governor the agent cann
 | --- | --- | --- |
 | G-1 signed manifest | Ed25519 detached signature verified before parsing | `TestFlippedByteInBody`, `TestMissingSignature` |
 | G-2 one channel | `socketpair(2)`, worker end on fd 3, no filesystem socket | `TestSpawnInheritsFD3` |
-| G-3 peer auth | `SO_PEERCRED` UID per frame, overflow UID rejected | `TestWrongUIDRejected`, `TestOverflowUIDRejected` |
+| G-3 peer auth | Kernel `SCM_CREDENTIALS` sender UID on every message, overflow UID rejected; worker dropped to its own user with `-worker-user` | `TestWrongUIDRejected`, `TestSpawnWithPrivilegeDrop` |
 | G-4 fixed schema | `{tool, args, task_id, justification}` + per-tool args schema, unknown fields rejected | `TestInvalidArgs` |
 | G-5 no LLM, no network | Import-grep test over every file in the binary | `TestNoForbiddenImports` |
 | G-6 kill switch | `SIGUSR1` or a file in `-kill-dir`, process group killed | `make demo-week1` variant below |
@@ -29,7 +33,7 @@ Not yet: OPA/Rego (week 2), Biscuit tokens and real executors (week 3), sandbox 
 
 ## Design decision: standard library only
 
-The governor imports nothing outside the Go standard library. Ed25519, `socketpair`, `SO_PEERCRED`, SHA-256 and JSON are all in stdlib, and the request validator is a 200-line subset of JSON Schema written here rather than a dependency. For a component whose whole job is to be the trust anchor, "nothing to audit but this repo" is worth more than a richer schema language. `TestNoForbiddenImports` fails if anyone adds a module import to the binary. Manifests are JSON for the same reason.
+The governor imports nothing outside the Go standard library. Ed25519, `socketpair`, `SCM_CREDENTIALS`, SHA-256 and JSON are all in stdlib, and the request validator is a 200-line subset of JSON Schema written here rather than a dependency. For a component whose whole job is to be the trust anchor, "nothing to audit but this repo" is worth more than a richer schema language. `TestNoForbiddenImports` fails if anyone adds a module import to the binary. Manifests are JSON for the same reason.
 
 Week 2's OPA embed is the one planned exception and is confined to `internal/policy`.
 
@@ -81,7 +85,7 @@ touch run/kill/STOP     # worker is gone within 100 ms; audit records "kill file
 cmd/agentd/            governor: startup, request loop, kill switch, verify subcommand
 cmd/sign-manifest/     operator tool: gen-key, sign, verify (offline)
 internal/manifest/     signed role description; refuses bad or missing signature
-internal/socket/       socketpair, fd 3 inheritance, SO_PEERCRED check, length-prefixed frames
+internal/socket/       socketpair, fd 3 inheritance, SCM_CREDENTIALS sender check, length-prefixed frames
 internal/schema/       fixed request frame + JSON Schema subset for tool args
 internal/policy/       structural-facts-only decision; week 2 swaps in OPA
 internal/taskstate/    call counts, taint high-water mark, delegation depth
@@ -96,4 +100,4 @@ Every Go package has a `doc.go` that says what it owns and what it must never do
 
 ## Requirements
 
-Linux (uses `socketpair`, `SO_PEERCRED`, process groups), Go 1.23+, Python 3.10+ for the client and worker. No network needed after `git clone`.
+Linux (uses `socketpair`, `SCM_CREDENTIALS`, process groups), Go 1.23+, Python 3.10+ for the client and worker. No network needed after `git clone`.

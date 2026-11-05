@@ -1,0 +1,185 @@
+# Test plan
+
+What "tested" means for this PoC, layer by layer, and what has to be true before each phase is called done. Requirement IDs (G-, P-, C-, D-, E-, A-) are from the PRD; the three added by the build plan are P-6, P-7 and G-8.
+
+The plan has four layers. Each answers a different question, and a change is not done until every layer that applies is green.
+
+| Layer | Runs with | Question | Today |
+| --- | --- | --- | --- |
+| L1 Unit | `make test` (`go test -race ./...`) | Does each package keep its `doc.go` promise? | 48 tests, green |
+| L2 Policy | `opa test policies/` **(week 2)** | Does each attack class resolve the way the attack table says? | Rules are in Go for now, covered by L1 (`internal/policy`) |
+| L3 Integrity | Manual procedures below; automated in `harness/integrity_test.go` **(week 6)** | Does the binary itself hold: signature, chain, socket auth, kill switch, no forbidden imports? | 6 manual procedures, 1 automated |
+| L4 Red team | `make redteam` **(week 6)** | With a real governor and a canned worker, does every adversarial case stop before execution? | Not built; the stub worker exercises 5 of the 16 cases informally |
+
+## L1: Unit tests
+
+Run on every change. Must be green with the race detector on. No test may be skipped on the reference host (Ubuntu 24.04, run as root); tests that need root print `SKIP` elsewhere and that is acceptable for development, not for sign-off.
+
+| Requirement | Package | Test | What it proves |
+| --- | --- | --- | --- |
+| G-1 | manifest | `TestFlippedByteInBody`, `TestFlippedByteInSignature`, `TestMissingSignature`, `TestWrongKey` | Any change to the manifest or signature, or the wrong key, refuses to load |
+| G-1 | manifest | `TestUnknownFieldRejected`, `TestBadKindRejected`, `TestSensitivityFloorRange` | A correctly signed but malformed manifest is still refused |
+| G-2 | socket | `TestSpawnInheritsFD3` | A real child finds the socket on fd 3 and the governor sees EOF when it exits |
+| G-3 | socket | `TestWrongUIDRejected`, `TestOverflowUIDRejected` | A sender with the wrong UID, or the overflow UID, is rejected before the frame body is read |
+| G-3 | socket | `TestSpawnWithPrivilegeDrop` (root only) | After a real `setuid`, the kernel-attached sender UID is what is checked, and it matches or rejects correctly |
+| G-3 | socket | `TestOversizedFrameRejected`, `TestZeroFrameRejected` | A hostile length prefix is refused before allocation |
+| G-4 | schema | `TestInvalidArgs` (13 cases), `TestParseRequest` (7 cases) | Extra fields, wrong types, bounds, enums, patterns, oversize, trailing data all rejected |
+| G-4 | schema | `TestCompileRejectsUnknownKeyword` | A schema using an unimplemented keyword fails at manifest load, not silently at request time |
+| G-5 | agentd | `TestNoForbiddenImports` | No file in the binary imports `net`, `net/http`, TLS, unsafe, plugin, any third-party module, or anything named like an LLM SDK |
+| G-7 | taskstate | `TestCallCounts`, `TestConcurrentCounts`, `TestForget` | Call counts are per task and per tool, exact under concurrency |
+| G-7, D-2 | taskstate | `TestTaintNeverFalls` | The taint high-water mark only rises |
+| G-8 | policy | `TestDelegationDepthDenied` | Depth over the manifest ceiling is denied before any other rule |
+| P-2 | policy | `TestInputCarriesNoAgentText` | By reflection: `policy.Input` has no field that could carry agent-authored text |
+| P-2 | policy | `TestDeterministic` | Identical structural facts produce identical decisions |
+| P-3 | policy | `TestAllowHappyPath`, `TestUnknownToolDenied` | Three verdicts, each with a rule id |
+| P-6 | policy | `TestSensitivityFloorPromotes` | `allow` becomes `approve` at the floor, not below it |
+| P-7 | policy | `TestFreeformOutboundNeedsHuman` | Freeform + outbound is `approve`; freeform inbound is not |
+| C-3 | policy | `TestCallCapDenied` | The cap denies at N, allows at N-1 |
+| A-1 | audit | `TestVerifyCleanChain`, `TestVerifyDetectsEditedByte`, `TestVerifyDetectsDeletedRecord` | An edited or deleted record is named by sequence number |
+| A-1 | audit | `TestReopenContinuesChain`, `TestReopenRefusesBrokenChain` | A valid chain is extended; a broken one is never extended |
+
+**Adding a test.** Every new requirement row in the PRD gets a row here and at least one test whose name a reviewer can grep for. A `doc.go` "must never" line without a test that would catch it is a gap.
+
+## L2: Policy tests (week 2)
+
+When `internal/policy` becomes an OPA embed, the rules move to `policies/*.rego` and these become the L2 suite:
+
+| File | Attack class | Minimum cases |
+| --- | --- | --- |
+| `policies/tests/injection_test.rego` | Prompt injection | Channel not in allow-list → deny; client-supplied labels ignored; justification length has no effect |
+| `policies/tests/exfiltration_test.rego` | Exfiltration | Taint over `sensitivity_floor` → approve; freeform outbound → approve; untrusted arg to outbound tool → approve |
+| `policies/tests/misuse_test.rego` | Tool misuse | Call cap → deny; tool not in role → deny |
+| `policies/tests/escalation_test.rego` | Privilege escalation | Delegation depth → deny; resource outside role → deny |
+| `policies/tests/monotonic_test.rego` | Governor integrity | `flow.rego` never produces `allow` where `base.rego` did not |
+
+Exit criterion: `opa test policies/ -v` reports zero failures and every row above has at least one passing test.
+
+## L3: Integrity procedures
+
+These test the binary rather than policy. Run them on the reference host after every deploy and before every demo. Each takes under a minute. They become `harness/integrity_test.go` in week 6; until then, the operator runs them by hand and records the result.
+
+### M-1: Tampered manifest is refused (G-1)
+
+```bash
+cp manifests/stub-agent.json /tmp/m.json && cp manifests/stub-agent.json.sig /tmp/m.json.sig
+sed -i 's/"max_calls_per_task": 3/"max_calls_per_task": 300/' /tmp/m.json
+bin/agentd run -manifest /tmp/m.json -pubkey keys/manifest-signing.pub -audit /tmp/x.jsonl -- true
+```
+**Pass:** exits 1 with `refusing to start: manifest: signature does not verify`. `/tmp/x.jsonl` is not created.
+
+### M-2: Missing signature is refused (G-1)
+
+```bash
+rm /tmp/m.json.sig
+bin/agentd run -manifest /tmp/m.json -pubkey keys/manifest-signing.pub -audit /tmp/x.jsonl -- true
+```
+**Pass:** `refusing to start: manifest: signature file missing`.
+
+### M-3: Wrong sender UID is rejected and the worker is killed (G-3)
+
+```bash
+sudo bin/agentd run -manifest manifests/stub-agent.json -pubkey keys/manifest-signing.pub \
+  -audit /tmp/wrong.jsonl -worker-uid 4242 -- python3 agents/stub_worker.py
+```
+**Pass:** returns within 2 seconds (no hang); the chain's second-to-last record is `event: stop` with detail beginning `request loop error, worker killed: socket: sender UID does not match`. No `verdict` records exist.
+
+### M-4: Privilege-dropped worker is accepted (G-3)
+
+```bash
+sudo bin/agentd run -manifest manifests/stub-agent.json -pubkey keys/manifest-signing.pub \
+  -audit /tmp/ok.jsonl -worker-user perimeter-worker -- python3 agents/stub_worker.py
+grep -c '"event":"verdict"' /tmp/ok.jsonl
+```
+**Pass:** worker prints eight lines; grep prints `7`; `bin/agentd verify -audit /tmp/ok.jsonl` says `ok: 13 records`.
+
+### M-5: Audit tamper is caught at the right record (A-1)
+
+```bash
+cp /tmp/ok.jsonl /tmp/t.jsonl && sed -i '4s/"allow"/"deny"/' /tmp/t.jsonl
+bin/agentd verify -audit /tmp/t.jsonl
+```
+**Pass:** `chain broken at record 5: prev_hash does not match previous record`. (Record 4 was edited; record 5 is the first whose link fails.)
+
+### M-6: Kill switch stops a running worker (G-6)
+
+```bash
+mkdir -p /tmp/kill && rm -f /tmp/kill/*
+sudo bin/agentd run -manifest manifests/stub-agent.json -pubkey keys/manifest-signing.pub \
+  -audit /tmp/kill.jsonl -kill-dir /tmp/kill -worker-user perimeter-worker \
+  -- python3 -c 'import time; time.sleep(60)' &
+sleep 1; touch /tmp/kill/STOP; time wait
+grep -o '"event":"kill","detail":"[^"]*"' /tmp/kill.jsonl
+```
+**Pass:** `wait` returns in well under a second; the chain has `"event":"kill","detail":"kill file STOP"` followed by `stop`.
+
+### M-7: Same facts, same verdict regardless of justification (P-2)
+
+Run M-4, then:
+```bash
+grep '"tool":"vault_lookup"' /tmp/ok.jsonl | grep -o '"verdict":"[a-z]*","rule_fired":"[^"]*".*"args_hash":"[0-9a-f]*"' | sort -u | wc -l
+```
+**Pass:** prints `1`. The stub worker calls `vault_lookup` twice, once with an empty justification and once with a 700-character one; both records are identical in verdict, rule and args hash.
+
+### M-8: Worker environment carries nothing (E-2 precursor)
+
+```bash
+sudo bin/agentd run -manifest manifests/stub-agent.json -pubkey keys/manifest-signing.pub \
+  -audit /tmp/env.jsonl -worker-user perimeter-worker -- env
+```
+**Pass:** exactly three lines: `PATH`, `PERIMETER_FD=3`, `PYTHONUNBUFFERED=1`. No `HOME`, no `VAULT_*`, no `*_API_KEY`, no proxy variables.
+
+## L4: Red-team harness (week 6)
+
+The harness is a Go test that starts a real `agentd` per case, drives a canned worker through the steps in a YAML file, and asserts on the audit chain. Cases live in `harness/cases/`; adding a case is adding a file. Every case in the PRD's attack table (16) plus the three from the build plan (19) must be present.
+
+Pass criterion for the suite: every case's chain shows `deny` or `approve` for the adversarial step, and the count of `executor` records for that step is zero. Cases designed to reach an executor and be rejected there (token replay) count as blocked when the `executor` record shows a non-zero exit and no side effect in the mock.
+
+Until week 6, the stub worker covers these informally: unknown tool, call cap, smuggled field, freeform outbound, justification retry. The other 14 cases need components from weeks 3 to 5.
+
+## Phase exit criteria
+
+A phase is done when every line in its block is true on the reference host.
+
+**Week 1 — Skeleton** (current)
+- [x] `make test` green with `-race`, zero skips when run as root
+- [x] M-1 through M-8 pass as written
+- [x] `make demo-week1` ends with `ok: 13 records, chain intact`
+- [x] `TestNoForbiddenImports` covers `cmd/agentd` and all of `internal/`
+- [x] `scripts/preflight.sh` passes on the reference host
+
+**Week 2 — Policy**
+- [ ] `internal/policy.Decide` evaluates `policies/*.rego` via embedded OPA; `Input`/`Decision` types unchanged
+- [ ] Policy bundle is Ed25519-signed and verified at startup like the manifest
+- [ ] L2 suite: five Rego test files, `opa test` green
+- [ ] Taint is raised by the governor when a tool result carries a sensitivity label; `TestTaintRaisedFromResult`
+- [ ] M-7 still passes with Rego in the loop
+- [ ] `TestNoForbiddenImports` updated to allow exactly the OPA module under `internal/policy` and nowhere else
+
+**Week 3 — Execution**
+- [ ] Per-execution Biscuit bound to tool, resource, args hash, 5 s TTL; `TestReplayWithDifferentArgsFails`
+- [ ] Executor binary verifies offline and exits non-zero on a bad token; rejection appears as an `executor` record
+- [ ] Vault AppRole login, JIT read, per-task lease cache; worker env still has no `VAULT_*` (M-8 extended)
+- [ ] Approval CLI shows tool, resource, taint, rule; 60 s timeout → `deny` with `reason_code: approval_timeout`; `TestApprovalTimeoutDenies`
+- [ ] New procedure M-9: replay a Biscuit from the audit tail against the executor by hand; rejected and recorded
+
+**Week 4 — Perimeter**
+- [ ] Worker runs in a container with seccomp, no capabilities, read-only root, no network interfaces
+- [ ] Executors run in a netns whose only route is the egress proxy (iptables `REDIRECT`); `curl` to an external host from `shell_exec` fails and the proxy logs host + role
+- [ ] Egress scan: AWS-key pattern in a `web_fetch` URL → `deny`, rule `egress_scan.high_confidence`
+- [ ] New procedures M-10 (shell escape blocked), M-11 (credential in URL denied)
+
+**Week 5 — Agents**
+- [ ] Three agents run five benign tasks each through the governor against the mocks: 15/15 complete
+- [ ] One executor family runs behind the MCP stdio bridge with identical verdicts
+- [ ] Swapping an agent changes only its manifest and run script
+
+**Week 6 — Red team and demo**
+- [ ] `make redteam`: 19/19 cases blocked, zero executions, printed per requirement ID
+- [ ] M-1 through M-11 automated in `harness/integrity_test.go`
+- [ ] Benchmark: p95 in-process overhead under 5 ms over 10,000 requests
+- [ ] `make demo` runs the 15-minute script clean three times in a row
+- [ ] `bin/agentd verify` clean after every demo run
+
+## Recording results
+
+Keep a one-line entry per sign-off in `docs/TESTLOG.md`: date, commit, host, `make test` result, M-procedures run and their outcome, who ran them. A demo should never be given from a commit that has no entry.
