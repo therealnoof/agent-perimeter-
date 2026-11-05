@@ -6,6 +6,7 @@ Per-action authorization for AI agents, enforced by a Go governor the agent cann
 
 **Status: week 1 of 6.** The governor skeleton is complete and tested. Not yet demo-ready for a customer; see [`docs/TESTPLAN.md`](docs/TESTPLAN.md) for exactly what is proven and what is not.
 
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — six diagrams: components and trust boundary, startup, request flow, policy decision, audit chain, shutdown
 - [`docs/DEPLOY.md`](docs/DEPLOY.md) — fresh-host install, worker account, signing, run, smoke test
 - [`docs/TESTPLAN.md`](docs/TESTPLAN.md) — four test layers, manual integrity procedures, per-phase exit criteria
 - [`docs/PLAN.md`](docs/PLAN.md) — link to the living build plan and the deviations log
