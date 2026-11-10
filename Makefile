@@ -101,17 +101,21 @@ $(GOVKEY): build
 
 gov-key: $(GOVKEY) ## Generate the governor token-signing key once (run/governor.key, mode 0600)
 
-services-up: build $(GOVKEY) ## Start mockserv and secretsd in the background (logs in run/)
+services-up: build $(GOVKEY) ## Start mockserv and secretsd in the background (logs and pidfiles in run/)
 	@mkdir -p $(RUN)
 	@chmod 600 deploy/secrets.demo.json
-	@pkill -f "$(BIN)/mockserv" 2>/dev/null; pkill -f "$(BIN)/secretsd" 2>/dev/null; true
-	@$(BIN)/mockserv -listen $(MOCKADDR) >$(RUN)/mockserv.log 2>&1 & echo "mockserv  on $(MOCKADDR)"
+	@$(MAKE) -s services-down
+	@$(BIN)/mockserv -listen $(MOCKADDR) >$(RUN)/mockserv.log 2>&1 & echo $$! > $(RUN)/mockserv.pid; echo "mockserv  on $(MOCKADDR) (pid $$!)"
 	@$(BIN)/secretsd -listen $(SECSOCK) -gov-pub $(GOVPUB) -manifest manifests/stub-agent.json -pubkey $(PUBKEY) \
-		-secrets-file deploy/secrets.demo.json >$(RUN)/secretsd.log 2>&1 & echo "secretsd  on $(SECSOCK)"
+		-secrets-file deploy/secrets.demo.json >$(RUN)/secretsd.log 2>&1 & echo $$! > $(RUN)/secretsd.pid; echo "secretsd  on $(SECSOCK) (pid $$!)"
 	@sleep 0.5
+	@kill -0 $$(cat $(RUN)/mockserv.pid) 2>/dev/null || { echo "mockserv failed to start:"; cat $(RUN)/mockserv.log; exit 1; }
+	@kill -0 $$(cat $(RUN)/secretsd.pid) 2>/dev/null || { echo "secretsd failed to start:"; cat $(RUN)/secretsd.log; exit 1; }
 
-services-down: ## Stop mockserv and secretsd
-	@pkill -f "$(BIN)/mockserv" 2>/dev/null; pkill -f "$(BIN)/secretsd" 2>/dev/null; true
+services-down: ## Stop mockserv and secretsd (by pidfile; never pkill -f, which matches this recipe's own shell)
+	@for s in mockserv secretsd; do \
+		if [ -f $(RUN)/$$s.pid ]; then kill $$(cat $(RUN)/$$s.pid) 2>/dev/null; rm -f $(RUN)/$$s.pid; fi; \
+	done
 
 demo-week3: check-signed services-up ## Real executors + credentials + a human approval prompt (answer a/d/j on the terminal)
 	$(BIN)/agentd run -manifest manifests/stub-agent.json -pubkey $(PUBKEY) -audit $(RUN)/audit3.jsonl \
