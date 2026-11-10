@@ -56,7 +56,7 @@ make sign-manifests   # writes manifests/*.json.sig
 make demo-week1       # verdict classes, call cap, schema rejection, justification retry
 make demo-week2       # staged exfiltration via taint
 make demo-week3       # real executors + credentials + an interactive approval prompt
-make auditview        # read-only dashboard on http://127.0.0.1:9800 (run alongside a demo)
+make auditview        # read-only dashboard, HTTPS on :9800 (self-signed unless AV_CERT/AV_KEY set)
 ```
 
 `make demo-week1` output ends with the stub worker hitting every verdict class:

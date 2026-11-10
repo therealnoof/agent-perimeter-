@@ -119,21 +119,23 @@ bin/mockserv -listen 127.0.0.1:9811 &             # Jira/Slack stand-in for the 
 
 A read-only page over the audit chain, the sidecar log and the mock's request log: trace timeline, span detail, taint over time, human decisions, credential releases joined to executor records, what reached the services, and a behavioural profile with anomaly flags. It never talks to the governor and is not part of the trust boundary.
 
-```bash
-make auditview                                   # http://127.0.0.1:9800, loopback only
-```
-
-From your laptop: `ssh -L 9800:127.0.0.1:9800 ubuntu@<host>` then open `http://localhost:9800`. That is the recommended way to view it: nothing listens on the network and no certificate is needed.
-
-For a room where others need to open it, bind a LAN address — the binary refuses a non-loopback bind without TLS:
+It serves **HTTPS only**. Without a certificate it generates a self-signed ECDSA P-256 one at startup (30 days, SANs for `localhost`, the hostname and every local IP) and prints the SHA-256 fingerprint:
 
 ```bash
-make auditview-cert                              # self-signed, 30 days, run/auditview.crt + .key
-bin/auditview -listen 0.0.0.0:8443 -tls-cert run/auditview.crt -tls-key run/auditview.key \
-  -audit run/audit3.jsonl -secretsd-log run/secretsd.log -mock-addr 127.0.0.1:9811
+make auditview
+# auditview: self-signed certificate, SHA-256 fingerprint 3A:7F:…
+# auditview: https://<this-host>:9800
 ```
 
-8443 rather than 443 so it never needs root or `CAP_NET_BIND_SERVICE`. Open `https://<host>:8443` and accept the self-signed certificate.
+Open `https://<host>:9800`. The browser warns once; compare the fingerprint it shows with the line above before accepting. To avoid the warning, use a certificate your browsers trust:
+
+```bash
+make auditview AV_CERT=/etc/ssl/agentd/auditview.crt AV_KEY=/etc/ssl/agentd/auditview.key
+```
+
+9800 is an unprivileged port, so the process never needs root or `CAP_NET_BIND_SERVICE`; put a reverse proxy or a firewall redirect in front if 443 is required. Plain HTTP exists only as `-plaintext` on a loopback address, for a tunnel; the binary refuses it anywhere else.
+
+Firewall: allow 9800/tcp from the operator's network only. The page has no authentication of its own in the PoC; what it shows is the audit trail, so treat the port like the log directory.
 
 ## 5. Runtime layout
 
@@ -308,4 +310,6 @@ No Go toolchain is needed on the target. The one dependency (cedar-go) is vendor
 | Worker line says `DENIED -> executor_failed` and the audit executor record has `exit_code: 3` | Executor could not get its credential: `secretsd` not running, wrong `-secrets-sock`, or the tool's `secret_path` is not in the secrets file | `make services-up`; check `run/secretsd.log` for `REFUSED` lines |
 | `exit_code: 2` on an executor record | Token rejected by the executor: wrong `-gov-pub`, or clock skew over 2 s between mint and verify | Check `run/governor.pub` matches the running governor's key; check the host clock |
 | `make keygen` / `agentd keygen` says `exists; refusing to overwrite` | A governor key is already there | Keep it; `make gov-key` only generates when missing |
+| Browser: `NET::ERR_CERT_AUTHORITY_INVALID` on the dashboard | Self-signed certificate | Compare the fingerprint auditview printed and accept, or supply `AV_CERT`/`AV_KEY` |
+| `auditview: -plaintext is allowed only on a loopback address` | Tried to serve HTTP on a LAN address | Drop `-plaintext`; HTTPS is the default |
 | `agentd verify` says `ok` but you expected a break | You edited a record's whitespace only | The hash covers the exact bytes; a whitespace edit does change it, so re-check the file you verified is the one you edited |
