@@ -16,6 +16,7 @@ import (
 	"os/signal"
 	"os/user"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -27,6 +28,7 @@ import (
 	"github.com/therealnoof/agent-perimeter/internal/egressscan"
 	"github.com/therealnoof/agent-perimeter/internal/manifest"
 	"github.com/therealnoof/agent-perimeter/internal/policy"
+	"github.com/therealnoof/agent-perimeter/internal/sandbox"
 	"github.com/therealnoof/agent-perimeter/internal/schema"
 	"github.com/therealnoof/agent-perimeter/internal/socket"
 	"github.com/therealnoof/agent-perimeter/internal/taskstate"
@@ -64,6 +66,10 @@ type governor struct {
 	secretsSock string
 	egressSock  string
 	mockAddr    string
+
+	// sandbox: "" or the bwrap path; seccomp is the compiled filter, opened
+	// fresh per spawn
+	bwrap string
 }
 
 func cmdRun(args []string) error {
@@ -81,6 +87,8 @@ func cmdRun(args []string) error {
 	executorBin := fs.String("executor", "bin/executor", "executor binary spawned per allowed call")
 	secretsSock := fs.String("secrets-sock", "", "secretsd socket passed to executors (empty: tools with secrets will fail)")
 	egressSock := fs.String("egress-sock", "", "egress-proxy socket passed to executors (empty: executors dial directly)")
+	sandboxMode := fs.String("sandbox", "none", "none | bwrap: confine the worker and every executor with bubblewrap + seccomp (week 4)")
+	sandboxRO := fs.String("sandbox-ro", "", "comma-separated directories the sandboxed worker may read (its script's directory is always included)")
 	mockAddr := fs.String("mock-addr", "127.0.0.1:9811", "mock service address passed to executors")
 	approver := fs.String("approver", "cli", "who answers approve verdicts: cli | deny | allow-all-UNSAFE-tests-only")
 	approvalTimeout := fs.Duration("approval-timeout", approval.DefaultTimeout, "how long a CLI prompt waits before deny")
@@ -181,6 +189,24 @@ func cmdRun(args []string) error {
 		fmt.Fprintln(os.Stderr, "agentd: WARNING: running as root with the worker also as root; use -worker-user for a real boundary")
 	}
 
+	// -sandbox bwrap: every process we start runs inside bubblewrap with no
+	// network, a read-only root and the seccomp deny list. Explicit, never
+	// a silent fallback: a perimeter that quietly turns itself off is worse
+	// than none.
+	var bwrap string
+	switch *sandboxMode {
+	case "none":
+		fmt.Fprintln(os.Stderr, "agentd: WARNING: -sandbox none; worker and executors are not confined")
+	case "bwrap":
+		p, err := sandbox.Available()
+		if err != nil {
+			return fmt.Errorf("run: -sandbox bwrap: %w", err)
+		}
+		bwrap = p
+	default:
+		return fmt.Errorf("run: -sandbox must be none or bwrap")
+	}
+
 	// Who launched the governor. This is originating_user on every record (A-5).
 	me := "uid:" + strconv.Itoa(os.Getuid())
 	if u, err := user.Current(); err == nil && u.Username != "" {
@@ -197,6 +223,21 @@ func cmdRun(args []string) error {
 		man: man, schemas: schemas, engine: engine, tasks: taskstate.New(), log: log, user: me, dryRun: *dryRun,
 		minter: tokens.NewMinter(govPriv, 0), approve: appr, scanner: egressscan.New(),
 		executorBin: *executorBin, govPubPath: *govPubOut, secretsSock: *secretsSock, egressSock: *egressSock, mockAddr: *mockAddr,
+		bwrap: bwrap,
+	}
+	// Executors are spawned by absolute path inside the sandbox, where PATH
+	// and the working directory mean nothing.
+	if g.bwrap != "" {
+		for _, p := range []*string{&g.executorBin, &g.govPubPath, &g.secretsSock, &g.egressSock} {
+			if *p != "" {
+				if abs, err := filepath.Abs(*p); err == nil {
+					*p = abs
+				}
+			}
+		}
+		if g.executorBin, err = exec.LookPath(g.executorBin); err != nil {
+			return fmt.Errorf("run: -executor: %w", err)
+		}
 	}
 
 	// Identity fingerprint of the worker we are about to start: the resolved
@@ -207,17 +248,44 @@ func cmdRun(args []string) error {
 	g.record(audit.Record{
 		Event: "start",
 		Detail: fmt.Sprintf("manifest=%s policies=%s worker_uid=%d dry_run=%v governor=%s approver=%s",
-			filepath.Base(*manifestPath), strings.Join(engine.Files(), ","), uid, *dryRun, tokens.Fingerprint(govPub)[:12], *approver),
+			filepath.Base(*manifestPath), strings.Join(engine.Files(), ","), uid, *dryRun, tokens.Fingerprint(govPub)[:12], *approver) +
+			" sandbox=" + *sandboxMode,
 		WorkerCmd: strings.Join(workerCmd, " "), WorkerExeSHA256: exeHash, WorkerScriptSHA256: scriptHash,
 	})
 
 	// --- G-2: spawn the worker with its end of the socketpair on fd 3. ---
-	cmd := exec.Command(workerCmd[0], workerCmd[1:]...)
+	var cmd *exec.Cmd
+	if g.bwrap == "" {
+		cmd = exec.Command(workerCmd[0], workerCmd[1:]...)
+		cmd.Env = minimalEnv()
+	} else {
+		// Inside bwrap: the worker sees /usr, its own script directory, any
+		// -sandbox-ro directories, a private /tmp, fd 3, and nothing else.
+		// The seccomp program rides in as fd 4 (socket.Spawn puts the
+		// socket at fd 3 and keeps what we queue here after it).
+		seccompFile, err := sandbox.SeccompFile()
+		if err != nil {
+			return fmt.Errorf("run: %w", err)
+		}
+		defer seccompFile.Close()
+		spec, err := workerSpec(workerCmd, *sandboxRO)
+		if err != nil {
+			return fmt.Errorf("run: %w", err)
+		}
+		spec.SeccompFD = 4
+		argv, err := sandbox.Argv(g.bwrap, spec)
+		if err != nil {
+			return fmt.Errorf("run: %w", err)
+		}
+		cmd = exec.Command(argv[0], argv[1:]...)
+		cmd.Env = []string{"PATH=/usr/bin:/bin"} // for bwrap itself; the worker gets spec.Env
+		cmd.ExtraFiles = []*os.File{seccompFile}
+	}
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	cmd.Env = minimalEnv()
 	// Own process group so the kill switch can take down the worker and
-	// everything it forked in one signal.
+	// everything it forked in one signal. With bwrap the group leader is
+	// bwrap; --die-with-parent takes the inside down with it.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, Credential: cred}
 
 	pair, err := socket.Spawn(cmd, uid, schema.MaxFrameBytes)
@@ -497,11 +565,42 @@ func (g *governor) execute(req *schema.Request, tool *manifest.Tool, target, arg
 	if g.egressSock != "" {
 		args = append(args, "-egress-sock", g.egressSock)
 	}
-	cmd := exec.Command(g.executorBin, args...)
+	var cmd *exec.Cmd
+	if g.bwrap == "" {
+		cmd = exec.Command(g.executorBin, args...)
+		cmd.Env = []string{"PATH=/usr/local/bin:/usr/bin:/bin"} // nothing of ours
+	} else {
+		// An executor inside bwrap sees its own binary, the governor public
+		// key, and the two sockets. No network interfaces: the egress proxy
+		// socket is the only way to a service, so -mock-addr direct would
+		// fail even if the family tried.
+		seccompFile, err := sandbox.SeccompFile()
+		if err != nil {
+			return nil, jti, 1, "sandbox: " + err.Error()
+		}
+		defer seccompFile.Close()
+		spec := sandbox.Spec{
+			Program: g.executorBin, Args: args,
+			ReadOnly:  []string{g.executorBin, g.govPubPath},
+			Env:       []string{"PATH=/usr/bin:/bin"},
+			SeccompFD: 3, // ExtraFiles[0]; the executor itself uses only stdio
+		}
+		for _, sock := range []string{g.secretsSock, g.egressSock} {
+			if sock != "" {
+				spec.Sockets = append(spec.Sockets, sock)
+			}
+		}
+		argv, err := sandbox.Argv(g.bwrap, spec)
+		if err != nil {
+			return nil, jti, 1, "sandbox: " + err.Error()
+		}
+		cmd = exec.Command(argv[0], argv[1:]...)
+		cmd.Env = []string{"PATH=/usr/bin:/bin"}
+		cmd.ExtraFiles = []*os.File{seccompFile}
+	}
 	cmd.Stdin = bytes.NewReader(job)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
-	cmd.Env = []string{"PATH=/usr/local/bin:/usr/bin:/bin"} // nothing of ours
 
 	err = cmd.Run()
 	code := 0
@@ -707,6 +806,50 @@ func minimalEnv() []string {
 		"PERIMETER_FD=" + strconv.Itoa(socket.WorkerFD),
 		"PYTHONUNBUFFERED=1",
 	}
+}
+
+// workerSpec describes the worker's sandbox: the interpreter resolved to an
+// absolute path, the script's directory read-only, plus any -sandbox-ro
+// directories, with the working directory kept so relative script paths in
+// the command line still resolve.
+func workerSpec(workerCmd []string, extraRO string) (sandbox.Spec, error) {
+	prog, err := exec.LookPath(workerCmd[0])
+	if err != nil {
+		return sandbox.Spec{}, err
+	}
+	if prog, err = filepath.Abs(prog); err != nil {
+		return sandbox.Spec{}, err
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		return sandbox.Spec{}, err
+	}
+	spec := sandbox.Spec{
+		Program: prog, Args: workerCmd[1:], Chdir: cwd, Tmp: true,
+		Env: minimalEnv(),
+	}
+	ro := map[string]bool{}
+	if len(workerCmd) > 1 {
+		if st, err := os.Stat(workerCmd[1]); err == nil && st.Mode().IsRegular() {
+			if dir, err := filepath.Abs(filepath.Dir(workerCmd[1])); err == nil {
+				ro[dir] = true
+			}
+		}
+	}
+	for _, d := range strings.Split(extraRO, ",") {
+		if d = strings.TrimSpace(d); d != "" {
+			abs, err := filepath.Abs(d)
+			if err != nil {
+				return sandbox.Spec{}, err
+			}
+			ro[abs] = true
+		}
+	}
+	for d := range ro {
+		spec.ReadOnly = append(spec.ReadOnly, d)
+	}
+	sort.Strings(spec.ReadOnly)
+	return spec, nil
 }
 
 func mustJSON(v any) json.RawMessage {

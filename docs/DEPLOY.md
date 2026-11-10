@@ -24,6 +24,7 @@ sudo -i          # or: sudo su -
 | Root or sudo | Yes, for the UID boundary | `agentd` starts as root so it can drop the worker to its own user |
 | Disk | 200 MB | Source, build cache, audit logs |
 | Network | None at runtime | Build needs `git clone` only; the governor is stdlib-only |
+| bubblewrap | `apt install bubblewrap` (week 4) | Sandboxes the worker and every executor: no network interfaces, read-only root, no capabilities, seccomp |
 
 Check it:
 
@@ -114,6 +115,38 @@ bin/mockserv -listen 127.0.0.1:9811 &             # Jira/Slack stand-in for the 
 ```
 
 `make services-up` / `make services-down` do this with pidfiles under `run/`.
+
+## 4d. The perimeter: egress proxy and sandbox (week 4)
+
+Two new pieces, both started for you by `make services-up` / `make demo-week4`.
+
+**Egress proxy** (`bin/egress-proxy`). Executors no longer open TCP connections. Each one dials a Unix socket (`run/egress.sock`), sends `CONNECT host:port` with its per-call governor token, and the proxy makes the real connection only if the token verifies and `host:port` is in that tool's `egress_hosts` list in the signed manifest. Every refusal is a JSON line in `run/egress-proxy.log` with tool, task, token id and host.
+
+```bash
+bin/egress-proxy -listen run/egress.sock -gov-pub run/governor.pub \
+  -manifest manifests/stub-agent.json -pubkey keys/manifest-signing.pub
+```
+
+**Sandbox** (`-sandbox bwrap`). With this flag the governor starts the worker and each executor inside bubblewrap:
+
+| Inside the sandbox | Worker | Executor |
+| --- | --- | --- |
+| Network interfaces | none | none |
+| Filesystem | `/usr` read-only, the script's directory, `-sandbox-ro` directories, a private `/tmp` | its own binary, `run/governor.pub` |
+| Sockets | fd 3 only (the governor) | `run/secrets.sock`, `run/egress.sock` |
+| Capabilities | none | none |
+| seccomp | deny list (mount, ptrace, bpf, keyctl, unshare, io_uring, module load, ...) | same |
+| Environment | `PATH`, `PERIMETER_FD`, `PYTHONUNBUFFERED` | `PATH` |
+
+```bash
+sudo apt install bubblewrap
+make demo-week4                        # worker as the current user
+WORKER_USER=perimeter-worker make demo-week4   # worker dropped to that account, then sandboxed
+```
+
+`-sandbox none` (the default) prints a warning on every start. There is no automatic fallback: if `bwrap` is missing, `-sandbox bwrap` refuses to start.
+
+What the demo shows, in order: a ticket summary comes back redacted; posting the placeholder outbound is denied (`egress.active`); an AWS-key-shaped string is denied (`egress.high_confidence`); `password =` in text asks you (`egress.low_confidence`); `detokenize` asks you (`flow.detokenize`); a `curl` straight from the worker fails because there is no interface; the worker cannot see `run/`, `keys/` or `/etc/passwd`; ordinary work still works.
 
 ## 4c. The dashboard (`auditview`)
 
@@ -287,13 +320,15 @@ No Go toolchain is needed on the target. The one dependency (cedar-go) is vendor
 
 | Component | Week | Effect today |
 | --- | --- | --- |
-| Worker container, executor netns, egress proxy | 4 | Boundary is UID + no environment; the worker still has host network |
 | Real agents, MCP bridge | 5 | Only the scripted stub worker |
 | Red-team harness | 6 | Manual smoke test above |
 
 ## Troubleshooting
 
 | Symptom | Cause | Fix |
+| `bwrap: setting up uid map: Permission denied` or `No permissions to create a new namespace` | Ubuntu 24.04 restricts unprivileged user namespaces (`kernel.apparmor_restrict_unprivileged_userns=1`) and the `bwrap` AppArmor profile is not loaded | `sudo apt install apparmor-profiles` and `sudo apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict`; or run the demo as root with `WORKER_USER=` set (root may create namespaces); last resort for a lab box only: `sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0` |
+| executor exits 4 with `egress proxy refused ... host not in egress_hosts` | The family dialled a host:port not listed for that tool | Add it to the tool's `egress_hosts` in the manifest and `make sign`; note `localhost` and `127.0.0.1` are different strings |
+| `-sandbox bwrap: bubblewrap is not installed` | | `sudo apt install bubblewrap` |
 | --- | --- | --- |
 | `refusing to start: manifest: signature does not verify` | Manifest edited after signing, or wrong public key | `make sign-manifests`; check `-pubkey` matches the signer |
 | `refusing to start: manifest: signature file missing` | No `.sig` beside the manifest | `make sign` |

@@ -329,9 +329,47 @@ sequenceDiagram
 
 **What the governor never has.** A backend credential, a Vault token, or a secret. If the governor is compromised, it can authorise calls it should not; it cannot harvest credentials. That is the reason the sidecar is a separate, operator-started process rather than a library inside the governor.
 
+## 8. The perimeter (week 4)
+
+Week 4 closes the two gaps the earlier diagrams flagged: the worker had host network, and the only thing between an executor and the internet was its own code. Now every untrusted process runs inside bubblewrap with no network interface, and the single way out is a Unix socket to a proxy that checks the per-call token and a per-tool host list. On the data side, the governor scans everything outbound and redacts sensitive fields inbound.
+
+```mermaid
+flowchart TB
+    subgraph wbox["bwrap: worker — no network interfaces, ro /usr, script dir, private /tmp, seccomp"]
+        W["stub_worker.py"]
+    end
+    subgraph host["host (operator processes)"]
+        direction TB
+        G["agentd (governor)<br/>egress scan · redaction · policy"]
+        S["secretsd<br/>unix socket"]
+        P["egress-proxy<br/>unix socket<br/>verifies token, checks egress_hosts"]
+        J["Jira / Slack<br/>(mockserv 127.0.0.1:9811)"]
+    end
+    subgraph xbox["bwrap: executor — no network interfaces, own binary only, seccomp"]
+        X["executor -family jira"]
+    end
+    W -- "fd 3 socketpair, SCM_CREDENTIALS" --> G
+    G -- "spawn, token on stdin" --> X
+    X -- "token" --> S
+    S -- "one secret, once" --> X
+    X -- "CONNECT 127.0.0.1:9811 + token" --> P
+    P -- "allowed: splice TCP" --> J
+    P -. "refused: 403, JSON log (tool, task, jti, host)" .-> X
+    W -. "curl: fails, no interface" .-x J
+```
+
+**Outbound (D-4, egress scan).** Before policy runs on an outbound tool, the governor scans the arguments. Four levels: `none`; `low` (a JWT shape, `password=`, a long hex run) → the human decides; `high` (AWS/GitHub/Slack/Stripe/Google key shapes, a private-key block, a token or basic auth in a URL) → deny, not overridable; `active` (a redaction placeholder or token id the governor itself issued) → deny, not overridable. The verdict record carries `egress_scan=<level> rule@$.path` — the path of the hit, never the value, so the audit chain cannot become the leak.
+
+**Inbound (redaction).** A tool's manifest can list `redact` fields. The governor replaces each with `[redacted:tok_xxxxxxxx]` in the result the worker receives and keeps the value in the task store. The worker can ask for it back with the `detokenize` tool, which the governor serves itself and which is always a human decision (`flow.detokenize`). Every placeholder is registered with the scanner, so trying to forward one is an `active` hit.
+
+**The proxy (E-4).** One CONNECT per TCP connection. The proxy verifies the token's signature and window against the governor's public key (it does not enforce single use; a family may legitimately open two connections for one call — the sidecar and the executor's own check do that), then looks the token's `tool` up in the manifest's `egress_hosts`. `127.0.0.1:9811` and `localhost:9811` are different strings on purpose: the list is exact, not resolved.
+
+**The sandbox (E-2, E-3).** `bwrap --unshare-all --cap-drop ALL --die-with-parent --new-session --clearenv`, a root assembled from `/usr` read-only and the handful of `/etc` entries a dynamic linker, Python and TLS need (never `/etc` itself), the process's own files, and the sockets it is entitled to, bound in as files. Unix sockets cross the network-namespace boundary because they are filesystem objects, which is the whole trick: the executor has no interface and still reaches the proxy. The seccomp filter is a classic-BPF program assembled in `internal/sandbox/seccomp.go` (no library): wrong architecture → kill; a syscall on the deny list (mount family, ptrace, process_vm_*, unshare/setns, bpf, perf_event_open, keyctl, io_uring, module loading, reboot, clock setting, ...) → `EPERM`; everything else → allow. `TestSeccompEnforces` installs the filter in a child and checks `unshare(2)` fails with `EPERM`.
+
+**What this does not do.** `clone3` flags cannot be filtered by seccomp (they are in a struct), so namespace creation via `clone` is stopped by `cap-drop ALL` and the userns nesting limit rather than the filter. The sandbox is only as strong as the kernel; a kernel exploit from inside is out of scope for the PoC and is the reason the production plan keeps a VM boundary around the host. And the proxy sees `host:port`, not URLs: with TLS it cannot inspect paths, which is correct (the scan happens on the arguments, before the call, where the plaintext is).
+
 ## What is deliberately not here yet
 
 | Piece | Week | Appears in diagram |
 | --- | --- | --- |
-| Worker container, executor netns, egress proxy | 4 | Hardens the worker box in §1; adds the proxy |
 | Real agents, MCP bridge | 5 | Replaces `stub_worker.py` in §1 |

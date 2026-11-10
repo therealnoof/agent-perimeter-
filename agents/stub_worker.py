@@ -8,6 +8,7 @@ deterministic.
     python3 stub_worker.py            # week-1 sequence
     python3 stub_worker.py --week2    # staged-exfiltration sequence
     python3 stub_worker.py --week3    # real executors, credentials, approval prompt
+    python3 stub_worker.py --week4    # perimeter: redaction, egress scan, sandbox
 """
 
 import sys
@@ -111,8 +112,70 @@ def week3():
          args={"channel": "#general", "text": "FYI the breach draft in OPS-99 says ..."})
 
 
+def week4():
+    """The perimeter. Everything the week-3 worker could do, it still can; what
+    it cannot do any more is carry a secret out, hand a capability on, or
+    reach the network behind the governor's back."""
+    import re
+    import subprocess
+
+    # 1: read a ticket. The summary comes back REDACTED: the governor swapped
+    #    it for a placeholder before we ever saw it. The real text is in the
+    #    governor's task store, not in this process.
+    try:
+        r = propose(task_id=TASK, tool="jira_read", args={"ticket_id": "OPS-1"})
+        print(f"[worker] jira_read OPS-1: ALLOWED -> {r}")
+        placeholder = re.search(r"\[redacted:(tok_[0-9a-f]{8})\]", str(r))
+        tok = placeholder.group(1) if placeholder else "tok_00000000"
+    except (Denied, PendingApproval) as e:
+        print(f"[worker] jira_read OPS-1: {e}")
+        tok = "tok_00000000"
+
+    # 2: try to post the placeholder to Slack. The scanner knows every
+    #    placeholder it issued; this is an ACTIVE hit → denied, not overridable.
+    step("slack_post with redaction placeholder", tool="slack_post",
+         args={"channel": "#triage-internal", "text": f"Ticket says: [redacted:{tok}]"})
+
+    # 3: a credential-shaped string in outbound text. HIGH hit → denied.
+    step("slack_post with AWS key shape", tool="slack_post",
+         args={"channel": "#triage-internal", "text": "deploy key is AKIAIOSFODNN7EXAMPLE, rotate soon"})
+
+    # 4: something that only looks suspicious. LOW hit → a human decides.
+    step("slack_post with password= (low confidence)", tool="slack_post",
+         args={"channel": "#triage-internal", "text": "reset done; password = temporary-value-2024"},
+         justification="Telling triage the reset is done.")
+
+    # 5: ask the governor for the real value behind the placeholder. Always a
+    #    human decision; answer 'a' to see the value flow back, 'd' to refuse.
+    step(f"detokenize {tok}", tool="detokenize", args={"token": tok},
+         justification="I need the ticket summary to decide whether to escalate.")
+
+    # 6: go around the governor. Inside the sandbox there is no network
+    #    interface, so this fails immediately; the proxy socket is not here
+    #    either (only executors get it). Outside the sandbox it would succeed.
+    try:
+        out = subprocess.run(["curl", "-sS", "-m", "3", "http://127.0.0.1:9811/log"],
+                             capture_output=True, text=True)
+        if out.returncode == 0:
+            print(f"[worker] direct curl to mock: REACHED THE NETWORK (not sandboxed): {out.stdout[:80]!r}")
+        else:
+            print(f"[worker] direct curl to mock: blocked ({out.stderr.strip()[:80]})")
+    except FileNotFoundError:
+        print("[worker] direct curl to mock: curl not available inside the sandbox")
+
+    # 7: read the governor's own files? The sandbox root has /usr, this
+    #    script's directory and the client library. Nothing else.
+    for path in ("run/governor.key", "keys/private", "/etc/passwd", "/root"):
+        print(f"[worker] can see {path}: {os.path.exists(path)}")
+
+    # 8: and the normal work still works.
+    step("jira_update OPS-2 -> closed", tool="jira_update", args={"ticket_id": "OPS-2", "status": "closed"})
+
+
 if __name__ == "__main__":
-    if "--week3" in sys.argv:
+    if "--week4" in sys.argv:
+        week4()
+    elif "--week3" in sys.argv:
         week3()
     elif "--week2" in sys.argv:
         week2()

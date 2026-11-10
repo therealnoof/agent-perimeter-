@@ -168,6 +168,38 @@ sudo bin/agentd run -manifest manifests/stub-agent.json -pubkey keys/manifest-si
 ```
 **Pass:** exactly three lines: `PATH`, `PERIMETER_FD=3`, `PYTHONUNBUFFERED=1`. No `HOME`, no `VAULT_*`, no `*_API_KEY`, no proxy variables.
 
+### M-13: Worker cannot reach the network from inside the sandbox (E-3, E-4)
+
+`make demo-week4` runs the worker's own check: step 6 runs `curl http://127.0.0.1:9811/log` from inside the worker.
+**Pass:** the worker prints `direct curl to mock: blocked (...)`; the mock's `/log` shows no request without an `X-Perimeter-Call` header. **Fail:** `REACHED THE NETWORK`.
+
+### M-14: Executor reaches a service only through the proxy, only for listed hosts (E-4)
+
+```bash
+grep '"event":"refused"' run/egress-proxy.log
+```
+after a run with `-mock-addr localhost:9811` (not on any `egress_hosts` list, which says `127.0.0.1:9811`).
+**Pass:** one `refused` line per attempted call naming tool, task, token id and `localhost:9811`; the executor record in the audit shows exit 4; the mock log is empty. Same run with `-mock-addr 127.0.0.1:9811`: `connect` lines and the calls succeed.
+
+### M-15: Credential-shaped outbound text is denied before any executor runs (D-4)
+
+Steps 2 and 3 of `--week4`.
+**Pass:** audit shows `verdict deny` with rule `egress.active` for the placeholder and `egress.high_confidence` for the AWS key shape; no `executor` record for either; the `Detail` of the verdict record names a JSON path (`$.text`), never the value. `grep -c AKIAIOSFODNN7EXAMPLE run/audit4.jsonl` prints `0`.
+
+### M-16: Redacted value never leaves the governor without a human (D-4)
+
+**Pass:** the worker's `jira_read OPS-1` result contains `[redacted:tok_...]`; `detokenize` produces an `approval` record; answering `d` yields `approval_denied` and the worker never sees the summary. `grep -c "Printer on floor 3" run/audit4.jsonl` prints `0` in both cases (the value is not written to the chain).
+
+### M-17: Sandbox filesystem view (E-2)
+
+Step 7 of `--week4` prints `can see <path>: False` for `run/governor.key`, `keys/private`, `/etc/passwd` and `/root`.
+**Pass:** all four `False`. Outside the sandbox (`-sandbox none`) at least the first two are `True`, which is the point.
+
+### M-18: seccomp filter is installed and enforces (E-2)
+
+`go test ./internal/sandbox/ -run TestSeccompEnforces -v` installs the compiled filter in a child process and calls `unshare(2)`.
+**Pass:** `denied=EPERM allowed=ok`. On the host, additionally: `grep Seccomp /proc/$(pgrep -f stub_worker.py)/status` during a `--week4` run prints `Seccomp: 2` (filter mode).
+
 ## L4: Red-team harness (week 6)
 
 The harness is a Go test that starts a real `agentd` per case, drives a canned worker through the steps in a YAML file, and asserts on the audit chain. Cases live in `harness/cases/`; adding a case is adding a file. Every case in the PRD's attack table (16) plus the three from the build plan (19) must be present.
@@ -205,10 +237,11 @@ A phase is done when every line in its block is true on the reference host.
 - [x] Taint from the source system's own classification, floored by the manifest (D-2 refinement)
 
 **Week 4 — Perimeter**
-- [ ] Worker runs in a container with seccomp, no capabilities, read-only root, no network interfaces
-- [ ] Executors run in a netns whose only route is the egress proxy (iptables `REDIRECT`); `curl` to an external host from `shell_exec` fails and the proxy logs host + role
-- [ ] Egress scan: AWS-key pattern in a `web_fetch` URL → `deny`, rule `egress_scan.high_confidence`
-- [ ] New procedures M-10 (shell escape blocked), M-11 (credential in URL denied)
+- [x] Worker runs under bubblewrap with seccomp, no capabilities, read-only root, no network interfaces (`-sandbox bwrap`; M-13, M-17, M-18)
+- [x] Executors have no network interfaces; their only route is the egress proxy on a Unix socket; a host off the tool's `egress_hosts` is refused and logged with tool, task, token id and host (M-14; design changed from iptables, see PLAN deviations)
+- [x] Egress scan: AWS-key pattern in outbound args → `deny`, rule `egress.high_confidence`; governor-issued placeholder or token id → `deny`, rule `egress.active`; weak signal → `approve` (`TestExfil_EgressScanLevels`, M-15)
+- [x] Ingress redaction with `detokenize` always human-gated (M-16)
+- [ ] Host sign-off of M-13..M-18 recorded in TESTLOG
 
 **Week 5 — Agents**
 - [ ] Three agents run five benign tasks each through the governor against the mocks: 15/15 complete

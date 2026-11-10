@@ -64,8 +64,10 @@ func Spawn(cmd *exec.Cmd, expectedUID uint32, maxFrame uint32) (*Pair, error) {
 	}
 
 	theirsFile := os.NewFile(uintptr(theirs), "worker-socket")
-	// ExtraFiles[0] lands on fd 3 in the child, regardless of its fd number here.
-	cmd.ExtraFiles = []*os.File{theirsFile}
+	// ExtraFiles[0] lands on fd 3 in the child, regardless of its fd number
+	// here. Anything the caller already queued (the sandbox's seccomp
+	// program) follows at fd 4, 5, ...
+	cmd.ExtraFiles = append([]*os.File{theirsFile}, cmd.ExtraFiles...)
 
 	if err := cmd.Start(); err != nil {
 		theirsFile.Close()

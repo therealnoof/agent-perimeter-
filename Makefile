@@ -14,7 +14,7 @@ PUBKEY    := $(KEYDIR)/manifest-signing.pub
 MANIFESTS := $(wildcard manifests/*.json)
 POLICIES  := $(wildcard policies/*.cedar)
 
-.PHONY: help build test check-signed gov-key services-up services-down demo-week3 auditview gen-key sign-manifests sign-policies sign verify-manifests verify-policies verify clean demo-week1 demo-week2
+.PHONY: help build test check-signed gov-key services-up services-down demo-week3 demo-week4 auditview gen-key sign-manifests sign-policies sign verify-manifests verify-policies verify clean demo-week1 demo-week2
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-18s %s\n", $$1, $$2}'
@@ -96,6 +96,8 @@ GOVKEY    := $(RUN)/governor.key
 GOVPUB    := $(RUN)/governor.pub
 SECSOCK   := $(RUN)/secrets.sock
 EGRSOCK   := $(RUN)/egress.sock
+# WORKER_USER=agent make demo-week4 → the worker (and bwrap) run as that user
+WORKER_USER_FLAG := $(if $(WORKER_USER),-worker-user $(WORKER_USER),)
 MOCKADDR  := 127.0.0.1:9811
 
 gov-key: build ## Generate the governor token-signing key if it does not exist (run/governor.key, mode 0600)
@@ -133,6 +135,19 @@ demo-week3: check-signed services-up ## Real executors + credentials + a human a
 	@echo "--- audit ---"
 	@grep -o '"event":"\(verdict\|approval\|executor\)".*"tool":"[a-z_]*"' $(RUN)/audit3.jsonl | sed 's/"originating_user[^,]*,"agent_role[^,]*,//' | cut -c1-160
 	$(BIN)/agentd verify -audit $(RUN)/audit3.jsonl
+	@$(MAKE) -s services-down
+
+demo-week4: check-signed services-up ## Perimeter: redaction, egress scan, sandboxed worker + executors (needs bubblewrap)
+	@command -v bwrap >/dev/null || { echo "bubblewrap is not installed: sudo apt install bubblewrap"; exit 1; }
+	$(BIN)/agentd run -manifest manifests/stub-agent.json -pubkey $(PUBKEY) -audit $(RUN)/audit4.jsonl \
+		-gov-key $(GOVKEY) -gov-pub-out $(GOVPUB) -executor $(BIN)/executor -secrets-sock $(SECSOCK) -egress-sock $(EGRSOCK) -mock-addr $(MOCKADDR) \
+		-sandbox bwrap -sandbox-ro client $(WORKER_USER_FLAG) \
+		-approver cli -approval-timeout 60s -- python3 agents/stub_worker.py --week4
+	@echo "--- egress proxy ---"
+	@cat $(RUN)/egress-proxy.log
+	@echo "--- audit ---"
+	@grep -o '"event":"\(verdict\|approval\|executor\)".*"tool":"[a-z_]*"' $(RUN)/audit4.jsonl | sed 's/"originating_user[^,]*,"agent_role[^,]*,//' | cut -c1-160
+	$(BIN)/agentd verify -audit $(RUN)/audit4.jsonl
 	@$(MAKE) -s services-down
 
 # --- dashboard -------------------------------------------------------------------
