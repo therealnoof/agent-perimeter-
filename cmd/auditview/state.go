@@ -74,10 +74,10 @@ type Request struct {
 	DryRun     bool   `json:"dry_run,omitempty"`
 
 	// Final outcome after approval and execution.
-	Outcome    string `json:"outcome"` // executed | denied | pending_timeout | declined | approved_then_failed | rejected
-	Approval   *ApprovalInfo `json:"approval,omitempty"`
-	Executor   *ExecInfo     `json:"executor,omitempty"`
-	RejectWhy  string        `json:"reject_why,omitempty"`
+	Outcome   string        `json:"outcome"` // executed | denied | pending_timeout | declined | approved_then_failed | rejected
+	Approval  *ApprovalInfo `json:"approval,omitempty"`
+	Executor  *ExecInfo     `json:"executor,omitempty"`
+	RejectWhy string        `json:"reject_why,omitempty"`
 
 	// Span timings.
 	SchemaUS   int64 `json:"t_schema_us"`
@@ -156,8 +156,8 @@ type Profile struct {
 }
 
 type Flag struct {
-	Severity string `json:"severity"` // info | warn | high
-	Text     string `json:"text"`
+	Severity string   `json:"severity"` // info | warn | high
+	Text     string   `json:"text"`
 	ReqIDs   []string `json:"req_ids,omitempty"`
 }
 
