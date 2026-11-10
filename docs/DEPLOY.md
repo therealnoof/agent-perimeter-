@@ -95,6 +95,26 @@ make verify                  # every manifest and policy must print "ok"
 
 To change a manifest or a policy: edit it, `make sign`, commit both files. Anything edited without re-signing refuses to load, which you can demonstrate on purpose (test plan M-1, M-9). `make demo-*` checks signatures first and tells you to run `make sign` if they are stale.
 
+## 4b. Governor key, sidecar, mock service (week 3)
+
+The governor signs a per-call token with its own key; executors and the secrets sidecar verify it. Generate the key once per installation:
+
+```bash
+bin/agentd keygen -out run/governor.key          # writes run/governor.key (0600) and run/governor.pub
+```
+
+The sidecar holds the only credential to the secrets backend and releases one secret per valid token. It is started by the operator, **not** by the governor, so the governor never has a path to a secret:
+
+```bash
+# file backend (demo); real deployments use -vault-addr ... with VAULT_SECRET_ID in the environment
+bin/secretsd -listen run/secrets.sock -gov-pub run/governor.pub \
+  -manifest manifests/stub-agent.json -pubkey keys/manifest-signing.pub \
+  -secrets-file deploy/secrets.demo.json &
+bin/mockserv -listen 127.0.0.1:9811 &             # Jira/Slack stand-in for the demo
+```
+
+`make services-up` / `make services-down` do this with pidfiles under `run/`.
+
 ## 5. Runtime layout
 
 ```bash
@@ -131,6 +151,12 @@ Flags:
 | `-kill-dir` | Any file appearing here stops the worker within 100 ms. `SIGUSR1` to `agentd` does the same. |
 | `-worker-user` | Drop the worker to this account. Requires `agentd` to start as root. Without it, the worker runs as the same user as the governor and `agentd` prints a warning: there is no boundary. |
 | `-worker-uid` | Expect this UID without dropping to it (for when something else, such as a container runtime, already set the UID). |
+| `-gov-key` | The governor's token-signing private key from `agentd keygen`. Required. Refused if readable by others. |
+| `-gov-pub-out` | Where to write the matching public key (default `run/governor.pub`); executors and `secretsd` read it. |
+| `-executor` | Executor binary spawned per allowed call (default `bin/executor`). |
+| `-secrets-sock` | The sidecar socket, passed to executors. Tools with a `secret_path` fail (exit 3) without it. |
+| `-approver` | `cli` (prompt on this terminal), `deny` (headless: every approve verdict is denied), or `allow-all-UNSAFE-tests-only`. |
+| `-approval-timeout` | How long a CLI prompt waits before deny (default 60s). |
 | `-dry-run` | Log every verdict but execute anyway. For tuning a policy against a real agent before enforcing it. Audit records carry `dry_run: true`. |
 | `--` | Everything after is the worker command. |
 
@@ -141,6 +167,25 @@ Expected output ends with the worker's eight lines and the governor returning to
 bin/agentd verify -audit "$(ls -t /var/lib/agent-perimeter/audit/*.jsonl | head -1)"
 # ok: 13 records, chain intact
 ```
+
+### The approval prompt
+
+With `-approver cli`, an `approve` verdict stops the governor at a box like this on its terminal:
+
+```
+┌─ APPROVAL REQUIRED ─────────────────────────────────────────
+│ task      demo-task-1
+│ tool      jira_update
+│ target    OPS-1
+│ taint     8  (highest sensitivity this task has touched)
+│ rule      flow.sensitivity_floor
+│ args      sha256:2f796fb245d3…
+│ (agent justification hidden; press j to show)
+└──────────────────────────────────────────────────────────────
+[approval] a=approve d=deny j=show agent justification (59s):
+```
+
+Everything shown is what the governor knows. `j` reveals what the agent wrote, labelled untrusted. No answer in 60 s is a deny with `approval_timeout`; a closed terminal is a deny with `approval_unavailable`. The approver's login (or `SUDO_USER`) is written to the audit record.
 
 ## 7. Smoke test (5 minutes)
 
@@ -220,8 +265,6 @@ No Go toolchain is needed on the target. The one dependency (cedar-go) is vendor
 
 | Component | Week | Effect today |
 | --- | --- | --- |
-| Executors, Biscuit tokens, Vault | 3 | Allowed calls return an echo of their args; nothing real runs |
-| Approval CLI | 3 | `approve` verdicts are returned to the worker as pending; nothing executes |
 | Worker container, executor netns, egress proxy | 4 | Boundary is UID + no environment; the worker still has host network |
 | Real agents, MCP bridge | 5 | Only the scripted stub worker |
 | Red-team harness | 6 | Manual smoke test above |
@@ -242,4 +285,7 @@ No Go toolchain is needed on the target. The one dependency (cedar-go) is vendor
 | `audit: chain broken at record N` on start | Existing audit file was edited or truncated | Start a new file; keep the broken one as evidence |
 | `git push` asks for a password and rejects it | GitHub does not accept account passwords over HTTPS | `gh auth login` then `gh auth setup-git`, or a fine-grained token as the password, or switch the remote to SSH |
 | `fatal: $HOME not set` from git or gh | Non-login root shell (`sudo -s`, `sudo su`) | `export HOME=/root`, or re-enter with `sudo -i` |
+| Worker line says `DENIED -> executor_failed` and the audit executor record has `exit_code: 3` | Executor could not get its credential: `secretsd` not running, wrong `-secrets-sock`, or the tool's `secret_path` is not in the secrets file | `make services-up`; check `run/secretsd.log` for `REFUSED` lines |
+| `exit_code: 2` on an executor record | Token rejected by the executor: wrong `-gov-pub`, or clock skew over 2 s between mint and verify | Check `run/governor.pub` matches the running governor's key; check the host clock |
+| `make keygen` / `agentd keygen` says `exists; refusing to overwrite` | A governor key is already there | Keep it; `make gov-key` only generates when missing |
 | `agentd verify` says `ok` but you expected a break | You edited a record's whitespace only | The hash covers the exact bytes; a whitespace edit does change it, so re-check the file you verified is the one you edited |

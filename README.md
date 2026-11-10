@@ -4,7 +4,7 @@ Per-action authorization for AI agents, enforced by a Go governor the agent cann
 
 `agentd` sits between an untrusted agent process and every tool it wants to call. The agent proposes an action over a single inherited socket; the governor validates it, decides against signed policy, runs it (or not), and records the outcome in a hash-chained audit log. The agent holds no credentials, has no network, and cannot influence the decision with anything it says.
 
-**Status: week 2 of 6.** Governor skeleton and Cedar policy engine complete and tested on a real host. Not yet demo-ready for a customer; see [`docs/TESTPLAN.md`](docs/TESTPLAN.md) for exactly what is proven and what is not.
+**Status: week 3 of 6.** Governor, Cedar policy, per-call tokens, executors, credential sidecar and the human approval gate are built and tested on a real host. Internal walkthrough-ready; customer demo needs weeks 4–6. Not yet demo-ready for a customer; see [`docs/TESTPLAN.md`](docs/TESTPLAN.md) for exactly what is proven and what is not.
 
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — six diagrams: components and trust boundary, startup, request flow, policy decision, audit chain, shutdown
 - [`docs/DEPLOY.md`](docs/DEPLOY.md) — fresh-host install, worker account, signing, run, smoke test
@@ -32,9 +32,13 @@ Per-action authorization for AI agents, enforced by a Go governor the agent cann
 
 | P-1 signed policy | `policies/*.cedar` + detached `.sig`, verified before parse | `TestLoadRefusesTamperedPolicy` |
 | P-3 three verdicts | Cedar allow/deny + `@verdict("approve")` forbids; approve requires a matching permit | `TestApproveAnnotationSemantics`, `TestInjection_PublicChannelDenied` |
-| D-2 taint from source | `result_sensitivity` on the tool raises the task mark after it runs | `make demo-week2` |
+| D-2 taint from source | Executor reports the source system's classification; manifest `result_sensitivity` is the floor | `make demo-week3` |
+| C-1, C-3 per-call token | Stdlib Ed25519, bound to tool + target + args hash, 5 s, single-use | `TestReplayWithDifferentArgsFails`, `TestSingleUse` |
+| C-2 executor verifies offline | `cmd/executor` checks the token against the governor key and re-hashes its args before anything runs | `itest.sh`: swapped args, wrong tool, rogue key all exit 2 |
+| E-1, E-2 credentials | `cmd/secretsd` releases one secret per valid token to the executor; the governor never holds one | `secretsd.log` `RELEASED`/`REFUSED` lines, M-12 |
+| A-3 human gate | CLI prompt: structural facts, justification behind `j`, 60 s → deny | `TestTimeoutDenies`, `TestJustificationHiddenUntilRequested` |
 
-Not yet: Biscuit tokens and real executors (week 3), sandbox and egress proxy (week 4), real agents (week 5), red-team harness (week 6).
+Not yet: worker container, executor network namespaces, egress proxy and credential scan (week 4), real agents and the MCP bridge (week 5), red-team harness (week 6).
 
 ## Design decision: standard library only
 
@@ -49,7 +53,9 @@ make build            # bin/agentd, bin/sign-manifest
 make test             # go test -race ./...
 make gen-key          # once: keys/manifest-signing.pub (committed) + private key (gitignored)
 make sign-manifests   # writes manifests/*.json.sig
-make demo-week1       # runs agentd with the scripted stub worker, prints the chain, verifies it
+make demo-week1       # verdict classes, call cap, schema rejection, justification retry
+make demo-week2       # staged exfiltration via taint
+make demo-week3       # real executors + credentials + an interactive approval prompt
 ```
 
 `make demo-week1` output ends with the stub worker hitting every verdict class:
@@ -93,6 +99,12 @@ internal/manifest/     signed role description; refuses bad or missing signature
 internal/socket/       socketpair, fd 3 inheritance, SCM_CREDENTIALS sender check, length-prefixed frames
 internal/schema/       fixed request frame + JSON Schema subset for tool args
 internal/policy/       Cedar engine over signed policies; structural facts in, verdict + rule id out
+internal/tokens/       per-call Ed25519 token: mint (governor) and verify (executor, sidecar)
+internal/approval/     CLI human gate for approve verdicts
+internal/canon/        the one canonical args encoding everyone hashes
+cmd/executor/          one process per allowed call; verifies the token, fetches its credential, does the work
+cmd/secretsd/          credential sidecar: file or Vault backend, releases one secret per valid token
+cmd/mockserv/          Jira/Slack stand-in with bearer auth and a request log
 policies/              base.cedar (global forbids) + one <role>.cedar per role (permits), each with .sig
 internal/taskstate/    call counts, taint high-water mark, delegation depth
 internal/audit/        hash-chained JSONL writer and verifier

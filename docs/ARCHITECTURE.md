@@ -1,6 +1,6 @@
-# Architecture, as built (week 1)
+# Architecture, as built (through week 3)
 
-Six diagrams, each answering one question about how `agentd` works today. They describe the code in this repository at this commit, not the plan. Where a part is a stand-in for something later, the diagram says so.
+Seven diagrams, each answering one question about how `agentd` works today. They describe the code in this repository at this commit, not the plan. Where a part is a stand-in for something later, the diagram says so.
 
 1. [What the pieces are and where the trust boundary sits](#1-components-and-trust-boundary)
 2. [What happens when `agentd` starts](#2-startup-sequence)
@@ -8,6 +8,7 @@ Six diagrams, each answering one question about how `agentd` works today. They d
 4. [How a verdict is reached](#4-policy-decision)
 5. [What the audit chain looks like and why edits are caught](#5-audit-chain)
 6. [How the governor stops](#6-shutdown-and-kill-switch)
+7. [How an allowed call gets its credential without the governor ever holding it](#7-execution-and-credential-path)
 
 ---
 
@@ -31,7 +32,9 @@ flowchart LR
             SC["internal/schema<br/>frame + per-tool args"]
             TS["internal/taskstate<br/>call counts, taint HWM,<br/>delegation depth"]
             P["internal/policy<br/>Cedar: signed *.cedar<br/>Decide(Input) → Decision"]
-            EX["execute()<br/>week-1 stub: echoes args"]
+            AP["internal/approval<br/>CLI prompt, 60 s → deny"]
+            TK["internal/tokens<br/>mint per-call token"]
+            EX["execute()<br/>spawn executor per call"]
             A["internal/audit<br/>hash-chained JSONL"]
             KS["kill switch goroutine<br/>SIGUSR1 or file in -kill-dir"]
         end
@@ -43,7 +46,20 @@ flowchart LR
             AG --> CL
         end
 
+        subgraph EXEC["Executor (one process per allowed call)"]
+            direction TB
+            E1["verify token offline<br/>re-hash args"]
+            E2["fetch credential<br/>with the same token"]
+            E3["do the work<br/>report exit code + sensitivity"]
+            E1 --> E2 --> E3
+        end
+
+        SD["secretsd (sidecar, operator-started)<br/>holds the backend credential<br/>releases one secret per valid token"]
+        SVC["Jira / Slack<br/>(mockserv in the PoC)"]
+        VAULT[("Vault KV v2<br/>or secrets file")]
+
         PUB["keys/manifest-signing.pub"]
+        GK[("run/governor.key (0600)<br/>run/governor.pub")]
         LOG[("audit/*.jsonl<br/>mode 700, not readable by worker")]
         KD[("-kill-dir")]
     end
@@ -53,23 +69,34 @@ flowchart LR
     CL <== "fd 3: socketpair<br/>length-prefixed JSON frames" ==> S
     S --> SC --> P
     TS <--> P
-    P --> EX
-    M -. "tools, schemas, floors" .-> SC & P
-    S & SC & P & EX & KS --> A --> LOG
+    P -- "approve" --> AP --> EX
+    P -- "allow" --> EX
+    TK --> EX
+    GK -. "private" .-> TK
+    GK -. "public" .-> E1 & SD
+    EX -- "stdin: token + args" --> EXEC
+    E2 <-- "unix socket" --> SD
+    SD --> VAULT
+    E3 --> SVC
+    EXEC -- "stdout: result, exit code" --> EX
+    M -. "tools, schemas, floors,<br/>secret paths" .-> SC & P & SD
+    S & SC & P & AP & EX & KS --> A --> LOG
     KD -. "watched" .-> KS
     KS -- "SIGKILL process group" --> WK
 
     classDef trusted fill:#e8f1fb,stroke:#2b6cb0,stroke-width:1.5px,color:#111;
     classDef untrusted fill:#fdecea,stroke:#c53030,stroke-width:1.5px,stroke-dasharray:4 3,color:#111;
     classDef store fill:#f3f4f6,stroke:#4b5563,color:#111;
-    class GOV,OP trusted;
+    class GOV,OP,EXEC,SD trusted;
     class WK untrusted;
-    class LOG,KD,PUB store;
+    class LOG,KD,PUB,GK,VAULT store;
 ```
 
 **Reading it.** Solid double arrow: the only channel the worker has. Dotted arrows: configuration the governor reads at startup. The worker has no network, no environment variables beyond `PATH`, no credentials, no view of the audit log, and no way to reach anything on the right side except by asking the governor over fd 3.
 
-**Stand-ins today.** `execute()` echoes the arguments back; week 3 replaces it with executors that hold a per-call token and a just-in-time credential. After a tool runs, the governor raises the task's taint mark to the tool's declared `result_sensitivity`, so §4's `taint_hwm` has a real source.
+**Where secrets are.** Only two boxes ever hold a service credential: `secretsd`, which holds the backend credential for its lifetime, and one executor, which holds one secret for one call. The governor's only knowledge of secrets is the sidecar's socket path, which it passes to executors. See §7.
+
+**Stand-ins today.** `mockserv` stands in for Jira and Slack. The worker still runs as a plain user rather than in a container, and executors share the host network; week 4 adds both.
 
 ---
 
@@ -137,11 +164,17 @@ flowchart TD
     A1 --> V{verdict}
 
     V -- deny --> X5["reply {deny, reason_code, rule}"]
-    V -- approve --> X6["reply {approve, reason_code, rule}<br/>(week 3: CLI approval gate)"]
+    X6["reply {deny, reason_code, rule}"]
+    V -- approve --> AP["approval.Ask<br/>CLI prompt, 60 s"]
+    AP --> A3["audit: approval<br/>approver_id, reason_code"]
+    A3 --> AQ{answer}
+    AQ -- deny / timeout --> X6
+    AQ -- approve --> R7
     V -- allow --> R7["taskstate.RecordAllow(task, tool)"]
-    R7 --> R8["execute()<br/>week-1 stub echoes args"]
-    R8 --> A2["audit: executor<br/>exit_code, args_hash"]
-    A2 --> X7["reply {allow, result}"]
+    R7 --> R8["execute(): mint token,<br/>spawn executor, stdin {token, args}"]
+    R8 --> R8b["taint ← max(manifest floor,<br/>executor-reported sensitivity)"]
+    R8b --> A2["audit: executor<br/>token_id, exit_code, taint_hwm, approver_id"]
+    A2 --> X7["reply {allow, result}<br/>or {deny, executor_failed}"]
 
     X2 & X3 & X4 & X5 & X6 & X7 --> R9([WriteFrame to worker])
     X1 --> R10([governor exits, no reply])
@@ -151,13 +184,15 @@ flowchart TD
     classDef ok fill:#ecfdf5,stroke:#047857,color:#111;
     classDef audit fill:#eef2ff,stroke:#4338ca,color:#111;
     class C1,C2,C3,V check;
-    class X1,X2,X3,X4,X5 stop;
-    class X6 check;
-    class X7,R7,R8 ok;
-    class A1,A2 audit;
+    class X1,X2,X3,X4,X5,X6 stop;
+    class AP,AQ check;
+    class X7,R7,R8,R8b ok;
+    class A1,A2,A3 audit;
 ```
 
 **Two things to notice.** The `justification` string enters at `ParseRequest` (length-checked) and then goes nowhere: it is not in `Input`, not in the hash, not in the audit record. And `args_hash` is computed once and threads through the verdict record, the executor record and, from week 3, the token — so the same canonical arguments produce the same hash everywhere, and a replay with different arguments is visible as a different hash.
+
+**Approve.** The approval record is written whatever the human answers, with who answered and why it resolved (`approved`, `declined`, `approval_timeout`, `approval_unavailable`). An approved call then follows the allow path, and its executor record carries the approver's id.
 
 **Dry-run.** With `-dry-run`, `deny` and `approve` still produce their audit record but fall through to `RecordAllow → execute`, and every record carries `dry_run: true`. That is how a policy is tuned against a real agent before it is enforced.
 
@@ -253,11 +288,50 @@ stateDiagram-v2
 
 ---
 
+## 7. Execution and credential path
+
+An allowed call becomes a short-lived signed token and a fresh process. The governor signs; the executor and the sidecar each verify independently against the governor's public key; the secret travels sidecar → executor and nowhere else.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant G as agentd
+    participant X as executor (new process)
+    participant S as secretsd (sidecar)
+    participant B as secrets backend
+    participant J as Jira (mockserv)
+
+    Note over G: verdict = allow (or approved)
+    G->>G: token = sign{jti, tool, target, args_hash, task, exp=+5s}
+    G->>X: spawn executor -family jira, stdin = {token, tool, target, args}
+    X->>X: verify signature vs governor.pub, window, binding
+    X->>X: args_hash(canonical args) == token.args_hash ?
+    alt token rejected
+        X-->>G: exit 2 with reason on stderr
+        G->>G: audit executor exit_code=2 → reply deny executor_failed
+    end
+    X->>S: {token, tool} over unix socket
+    S->>S: verify signature, window, tool ↔ manifest secret_path
+    S->>S: jti seen before? → refuse (single use)
+    S->>B: read secret_path
+    B-->>S: credential
+    S-->>X: {ok, secret}
+    Note over S: log RELEASED tool jti task path
+    X->>J: HTTP with Bearer credential
+    J-->>X: result (incl. the source's own classification)
+    X-->>G: stdout {ok, jti, result, sensitivity}, exit 0
+    G->>G: taint = max(manifest floor, sensitivity)
+    G->>G: audit executor token_id, exit_code, taint_hwm
+    Note over X: process exits, credential gone with it
+```
+
+**What a captured token buys an attacker.** Nothing useful: it is bound to one tool, one target and one exact set of arguments (steps 4–5), it is refused by the sidecar the second time it is seen (step 8), and it expires in five seconds. The replay, swapped-args, wrong-tool and rogue-key cases are all in `itest.sh` and the test plan (M-10).
+
+**What the governor never has.** A backend credential, a Vault token, or a secret. If the governor is compromised, it can authorise calls it should not; it cannot harvest credentials. That is the reason the sidecar is a separate, operator-started process rather than a library inside the governor.
+
 ## What is deliberately not here yet
 
 | Piece | Week | Appears in diagram |
 | --- | --- | --- |
-| Per-call Biscuit token, executors, Vault | 3 | Replaces `execute()` in §1 and §3; adds token id to §5 |
-| CLI approval gate, 60 s deny-by-default | 3 | Fills the `approve` branch in §3; fills `approver_id` in §5 |
 | Worker container, executor netns, egress proxy | 4 | Hardens the worker box in §1; adds the proxy |
 | Real agents, MCP bridge | 5 | Replaces `stub_worker.py` in §1 |

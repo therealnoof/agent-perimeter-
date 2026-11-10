@@ -6,7 +6,7 @@ The plan has four layers. Each answers a different question, and a change is not
 
 | Layer | Runs with | Question | Today |
 | --- | --- | --- | --- |
-| L1 Unit | `make test` (`go test -race ./...`) | Does each package keep its `doc.go` promise? | 70 tests, green |
+| L1 Unit | `make test` (`go test -race ./...`) | Does each package keep its `doc.go` promise? | 95 tests, green |
 | L2 Policy | `go test ./internal/policy/` | Does each attack class resolve the way the attack table says, against the real signed `.cedar` files? | 4 attack-class files + engine properties, green |
 | L3 Integrity | Manual procedures below; automated in `harness/integrity_test.go` **(week 6)** | Does the binary itself hold: signature, chain, socket auth, kill switch, no forbidden imports? | 6 manual procedures, 1 automated |
 | L4 Red team | `make redteam` **(week 6)** | With a real governor and a canned worker, does every adversarial case stop before execution? | Not built; the stub worker exercises 5 of the 16 cases informally |
@@ -37,6 +37,13 @@ Run on every change. Must be green with the race detector on. No test may be ski
 | C-3 | policy | `TestCallCapDenied` | The cap denies at N, allows at N-1 |
 | A-1 | audit | `TestVerifyCleanChain`, `TestVerifyDetectsEditedByte`, `TestVerifyDetectsDeletedRecord` | An edited or deleted record is named by sequence number |
 | A-1 | audit | `TestReopenContinuesChain`, `TestReopenRefusesBrokenChain` | A valid chain is extended; a broken one is never extended |
+| C-1 | tokens | `TestReplayWithDifferentArgsFails`, `TestSingleUse`, `TestExpired` | A token is bound to tool, target and args hash; is single-use; dies at TTL |
+| C-2 | tokens | `TestUnknownGovernor`, `TestTamperedBody`, `TestMalformed` | Only the governor's key verifies; any edit breaks the signature |
+| C-3 | tokens | `TestSeenSetPrunes` | The replay set is bounded |
+| A-3 | approval | `TestTimeoutDenies`, `TestEOFDenies` | Silence and a closed terminal are both deny, never allow |
+| A-3 | approval | `TestJustificationHiddenUntilRequested` | Agent text is shown only on `j`, labelled untrusted |
+| A-3 | approval | `TestSequentialPromptsOnOneCLI`, `TestStaleInputIsDrained` | A second prompt gets its own keystrokes; input typed before a prompt cannot answer it |
+| G-4, C-1 | canon | `TestKeyOrderAndWhitespaceDoNotMatter`, `TestValuesMatter` | Governor and executor hash identical args identically |
 
 **Adding a test.** Every new requirement row in the PRD gets a row here and at least one test whose name a reviewer can grep for. A `doc.go` "must never" line without a test that would catch it is a gap.
 
@@ -130,6 +137,29 @@ bin/agentd run -manifest manifests/stub-agent.json -pubkey keys/manifest-signing
 ```
 **Pass:** `refusing to start: policy: signature does not verify: /tmp/pol/base.cedar`. The classic attack, a forbid flipped to a permit after signing, never loads.
 
+### M-10: Token replay and binding at the executor (C-1, C-2)
+
+The integration script in the build session (`itest.sh`) drives `executor` directly with tokens minted from a governor key, bypassing `agentd`, and is the reference for these. On the host, with `make services-up` running:
+
+```bash
+# a token minted by agentd is single-use: the sidecar refuses the second presentation
+bin/agentd run ... -approver deny -- python3 agents/stub_worker.py --week3   # any run
+grep -c RELEASED run/secretsd.log; grep -c REFUSED run/secretsd.log
+```
+**Pass:** every `RELEASED` line has a distinct `jti`; no two calls share a token. Executor records in the chain carry the same `token_id` values.
+
+### M-11: Approval timeout and justification gating (A-3)
+
+Run `make demo-week3`, let the first prompt time out, press `j` then `d` on the second.
+**Pass:** first worker line after the prompt reads `DENIED -> denied: approval_timeout`; the audit has `"event":"approval"` with `reason_code: approval_timeout`; the second prompt's justification appears only after `j`, under the `untrusted` label; the `approval` record carries `approver_id` = your login (or `SUDO_USER`).
+
+### M-12: Governor never holds a secret (E-2)
+
+```bash
+grep -rn "secret" cmd/agentd/*.go | grep -v "secrets-sock\|secretsSock\|// \|secretsd"
+```
+**Pass:** nothing. The governor's only knowledge of secrets is the sidecar socket path it passes to executors. `strings bin/agentd | grep -c jira-demo-token` prints `0`.
+
 ### M-8: Worker environment carries nothing (E-2 precursor)
 
 ```bash
@@ -166,12 +196,13 @@ A phase is done when every line in its block is true on the reference host.
 - [x] `TestNoForbiddenImports` allows exactly `github.com/cedar-policy/cedar-go` under `internal/policy` and nowhere else
 - [x] New procedure M-9: tampered policy refused
 
-**Week 3 — Execution**
-- [ ] Per-execution Biscuit bound to tool, resource, args hash, 5 s TTL; `TestReplayWithDifferentArgsFails`
-- [ ] Executor binary verifies offline and exits non-zero on a bad token; rejection appears as an `executor` record
-- [ ] Vault AppRole login, JIT read, per-task lease cache; worker env still has no `VAULT_*` (M-8 extended)
-- [ ] Approval CLI shows tool, resource, taint, rule; 60 s timeout → `deny` with `reason_code: approval_timeout`; `TestApprovalTimeoutDenies`
-- [ ] New procedure M-9: replay a Biscuit from the audit tail against the executor by hand; rejected and recorded
+**Week 3 — Execution** (done 2026-11-10; stdlib token instead of Biscuit, sidecar instead of in-governor Vault, see PLAN.md)
+- [x] Per-execution token bound to tool, target, args hash, 5 s TTL, single-use; `TestReplayWithDifferentArgsFails`, `TestSingleUse`
+- [x] Executor verifies offline, re-hashes the args it received, exits 2 on a bad token; the exit code is an `executor` record
+- [x] Credentials released by `secretsd` only against a valid token; Vault KV v2 over AppRole or a file; the governor has no backend credential (M-12)
+- [x] Approval CLI shows tool, target, taint, rule, args hash; 60 s → `approval_timeout`; justification behind `j`; `TestTimeoutDenies`, `TestJustificationHiddenUntilRequested`
+- [x] M-10 replay, M-11 approval, M-12 governor-holds-no-secret
+- [x] Taint from the source system's own classification, floored by the manifest (D-2 refinement)
 
 **Week 4 — Perimeter**
 - [ ] Worker runs in a container with seccomp, no capabilities, read-only root, no network interfaces
