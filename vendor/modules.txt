@@ -1,0 +1,26 @@
+# github.com/cedar-policy/cedar-go v1.9.0
+## explicit; go 1.26.0
+github.com/cedar-policy/cedar-go
+github.com/cedar-policy/cedar-go/ast
+github.com/cedar-policy/cedar-go/internal
+github.com/cedar-policy/cedar-go/internal/consts
+github.com/cedar-policy/cedar-go/internal/eval
+github.com/cedar-policy/cedar-go/internal/extensions
+github.com/cedar-policy/cedar-go/internal/json
+github.com/cedar-policy/cedar-go/internal/mapset
+github.com/cedar-policy/cedar-go/internal/parser
+github.com/cedar-policy/cedar-go/internal/rust
+github.com/cedar-policy/cedar-go/internal/scanner
+github.com/cedar-policy/cedar-go/types
+github.com/cedar-policy/cedar-go/x/exp/ast
+# github.com/go-json-experiment/json v0.0.0-20260820222146-c27c302e5fc3
+## explicit; go 1.26
+github.com/go-json-experiment/json
+github.com/go-json-experiment/json/internal
+github.com/go-json-experiment/json/internal/jsonflags
+github.com/go-json-experiment/json/internal/jsonopts
+github.com/go-json-experiment/json/internal/jsonwire
+github.com/go-json-experiment/json/jsontext
+# golang.org/x/exp v0.0.0-20220921023135-46d9e7742f1e
+## explicit; go 1.18
+golang.org/x/exp/constraints
