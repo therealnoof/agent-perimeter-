@@ -13,14 +13,14 @@ func TestInjection_PublicChannelDenied(t *testing.T) {
 	in := stubAgent("slack_post")
 	in.Target = "#general"
 	d := e.Decide(in)
-	if d.Verdict != Deny {
-		t.Fatalf("got %+v, want deny", d)
+	if d.Verdict != Deny || d.Rule != "base.default_deny" {
+		t.Fatalf("got %+v, want deny by base.default_deny", d)
 	}
-	// The forbid fires too (freeform outbound), but with no permit matched
-	// the rule reported should still identify a forbid or default deny, and
-	// the verdict must be deny, never approve.
-	if d.Verdict == Approve {
-		t.Fatal("an unpermitted target must not be escalated to a human")
+	// Same tool, permitted channel: the SAME forbid fires, but now a permit
+	// exists for a human to confirm, so it is approve. The pair is the test.
+	in.Target = "#triage-internal"
+	if d := e.Decide(in); d.Verdict != Approve || d.Rule != "flow.freeform_outbound" {
+		t.Fatalf("permitted channel: got %+v, want approve", d)
 	}
 }
 

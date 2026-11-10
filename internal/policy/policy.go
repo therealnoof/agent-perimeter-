@@ -76,8 +76,15 @@ type Decision struct {
 }
 
 // Engine holds a loaded, signature-verified policy set.
+//
+// hard is the same set with every @verdict("approve") forbid removed. It
+// answers the question Cedar's diagnostic cannot: when the full set denies
+// and only overridable forbids fired, would anything have PERMITTED the
+// request? If not, there is nothing for a human to override and the answer
+// is deny, not approve.
 type Engine struct {
 	set   *cedar.PolicySet
+	hard  *cedar.PolicySet
 	files []string // for the audit "start" record
 }
 
@@ -105,7 +112,7 @@ func Load(dir string, pub ed25519.PublicKey) (*Engine, error) {
 	}
 	sort.Strings(paths) // deterministic policy IDs run to run
 
-	set := cedar.NewPolicySet()
+	set, hard := cedar.NewPolicySet(), cedar.NewPolicySet()
 	var files []string
 	for _, p := range paths {
 		raw, err := os.ReadFile(p)
@@ -133,10 +140,18 @@ func Load(dir string, pub ed25519.PublicKey) (*Engine, error) {
 		for i, pol := range list {
 			id := types.PolicyID(fmt.Sprintf("%s:%d", filepath.Base(p), i))
 			set.Add(id, pol)
+			if !overridable(pol) {
+				hard.Add(id, pol)
+			}
 		}
 		files = append(files, filepath.Base(p))
 	}
-	return &Engine{set: set, files: files}, nil
+	return &Engine{set: set, hard: hard, files: files}, nil
+}
+
+// overridable reports whether a policy is a forbid a human may override.
+func overridable(p *cedar.Policy) bool {
+	return p.Effect() == cedar.Forbid && annotation(p, "verdict") == "approve"
 }
 
 // LoadUnsigned parses policies from in-memory text with no signature check.
@@ -146,11 +161,15 @@ func LoadUnsigned(name string, text []byte) (*Engine, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrParse, err)
 	}
-	set := cedar.NewPolicySet()
+	set, hard := cedar.NewPolicySet(), cedar.NewPolicySet()
 	for i, pol := range list {
-		set.Add(types.PolicyID(fmt.Sprintf("%s:%d", name, i)), pol)
+		id := types.PolicyID(fmt.Sprintf("%s:%d", name, i))
+		set.Add(id, pol)
+		if !overridable(pol) {
+			hard.Add(id, pol)
+		}
 	}
-	return &Engine{set: set, files: []string{name}}, nil
+	return &Engine{set: set, hard: hard, files: []string{name}}, nil
 }
 
 // Files returns the policy file names that were loaded, for the audit log.
@@ -210,18 +229,25 @@ func (e *Engine) evaluate(in Input) Decision {
 		// Nothing forbade it; nothing permitted it either.
 		return Decision{Deny, "base.default_deny", "no_permit_matched"}
 	}
-	allApprove := true
+	rule := e.ruleFor(diag, cedar.Forbid, "base.forbid")
 	for _, p := range forbids {
-		if annotation(p, "verdict") != "approve" {
-			allApprove = false
-			break
+		if !overridable(p) {
+			// At least one forbid is final. Nobody can override this.
+			return Decision{Deny, rule, strings.ReplaceAll(rule, ".", "_")}
 		}
 	}
-	rule := e.ruleFor(diag, cedar.Forbid, "base.forbid")
-	if allApprove {
+
+	// Only overridable forbids fired. That is "approve" only if something
+	// would have permitted the request without them; otherwise there is no
+	// grant for a human to confirm and the answer is still deny.
+	hardDec, hardDiag := cedar.Authorize(e.hard, ents, req)
+	if len(hardDiag.Errors) > 0 {
+		return Decision{Deny, "engine.error", "policy_evaluation_error"}
+	}
+	if hardDec == cedar.Allow {
 		return Decision{Approve, rule, strings.TrimPrefix(rule, "flow.")}
 	}
-	return Decision{Deny, rule, strings.ReplaceAll(rule, ".", "_")}
+	return Decision{Deny, "base.default_deny", "no_permit_matched"}
 }
 
 // buildContext packs the governor's facts into the Cedar context record.
