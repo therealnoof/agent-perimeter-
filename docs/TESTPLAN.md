@@ -6,8 +6,8 @@ The plan has four layers. Each answers a different question, and a change is not
 
 | Layer | Runs with | Question | Today |
 | --- | --- | --- | --- |
-| L1 Unit | `make test` (`go test -race ./...`) | Does each package keep its `doc.go` promise? | 48 tests, green |
-| L2 Policy | `opa test policies/` **(week 2)** | Does each attack class resolve the way the attack table says? | Rules are in Go for now, covered by L1 (`internal/policy`) |
+| L1 Unit | `make test` (`go test -race ./...`) | Does each package keep its `doc.go` promise? | 70 tests, green |
+| L2 Policy | `go test ./internal/policy/` | Does each attack class resolve the way the attack table says, against the real signed `.cedar` files? | 4 attack-class files + engine properties, green |
 | L3 Integrity | Manual procedures below; automated in `harness/integrity_test.go` **(week 6)** | Does the binary itself hold: signature, chain, socket auth, kill switch, no forbidden imports? | 6 manual procedures, 1 automated |
 | L4 Red team | `make redteam` **(week 6)** | With a real governor and a canned worker, does every adversarial case stop before execution? | Not built; the stub worker exercises 5 of the 16 cases informally |
 
@@ -40,19 +40,21 @@ Run on every change. Must be green with the race detector on. No test may be ski
 
 **Adding a test.** Every new requirement row in the PRD gets a row here and at least one test whose name a reviewer can grep for. A `doc.go` "must never" line without a test that would catch it is a gap.
 
-## L2: Policy tests (week 2)
+## L2: Policy tests
 
-When `internal/policy` becomes an OPA embed, the rules move to `policies/*.rego` and these become the L2 suite:
+`internal/policy` tests load the repository's real `policies/*.cedar` files through the signed `Load` path (signing them with a throwaway key in a temp dir), so a policy edit that breaks an attack case fails `make test`. One file per attack class, plus engine-property tests. This is what `opa test` would have been.
 
-| File | Attack class | Minimum cases |
+| File | Attack class | Cases |
 | --- | --- | --- |
-| `policies/tests/injection_test.rego` | Prompt injection | Channel not in allow-list → deny; client-supplied labels ignored; justification length has no effect |
-| `policies/tests/exfiltration_test.rego` | Exfiltration | Taint over `sensitivity_floor` → approve; freeform outbound → approve; untrusted arg to outbound tool → approve |
-| `policies/tests/misuse_test.rego` | Tool misuse | Call cap → deny; tool not in role → deny |
-| `policies/tests/escalation_test.rego` | Privilege escalation | Delegation depth → deny; resource outside role → deny |
-| `policies/tests/monotonic_test.rego` | Governor integrity | `flow.rego` never produces `allow` where `base.rego` did not |
+| `attack_injection_test.go` | Prompt injection | Unpermitted channel → deny (`base.default_deny`), permitted channel → approve, same pair in one test; retry with "longer justification" is the identical decision; client cannot lower taint |
+| `attack_exfiltration_test.go` | Exfiltration | Taint at/over `sensitivity_floor` → approve, under → allow; tool with no floor ignores taint; freeform outbound → approve; freeform inbound → allow |
+| `attack_misuse_test.go` | Tool misuse | Unknown tool → deny; call cap at N → deny, N-1 → allow; `max_calls` 0 is uncapped; happy path → allow with rule id |
+| `attack_escalation_test.go` | Privilege escalation | Delegation depth → deny in Go; same rule denies in Cedar alone (`evaluate`); tool outside role → deny; role file cannot override base |
+| `policy_test.go` | Engine properties | `Input` carries no agent text (reflection); deterministic; unsigned / tampered / empty policy dir refused; forbid always wins; `@verdict("approve")` semantics incl. soft+hard = deny; evaluation error fails closed |
 
-Exit criterion: `opa test policies/ -v` reports zero failures and every row above has at least one passing test.
+Exit criterion: `go test ./internal/policy/` green, and every PRD attack case that policy can decide (as opposed to the sandbox or executors) has a row above.
+
+**Found by this layer:** on the first real build, `TestInjection_PublicChannelDenied` caught the engine returning `approve` for a target no policy permitted. Fixed in `5820909`.
 
 ## L3: Integrity procedures
 
@@ -120,6 +122,14 @@ grep '"tool":"vault_lookup"' /tmp/ok.jsonl | grep -o '"verdict":"[a-z]*","rule_f
 ```
 **Pass:** prints `1`. The stub worker calls `vault_lookup` twice, once with an empty justification and once with a 700-character one; both records are identical in verdict, rule and args hash.
 
+### M-9: Tampered policy is refused (P-1)
+
+```bash
+cp -r policies /tmp/pol && sed -i 's/forbid (principal, action, resource)/permit (principal, action, resource)/' /tmp/pol/base.cedar
+bin/agentd run -manifest manifests/stub-agent.json -pubkey keys/manifest-signing.pub -policies /tmp/pol -audit /tmp/x.jsonl -- true
+```
+**Pass:** `refusing to start: policy: signature does not verify: /tmp/pol/base.cedar`. The classic attack, a forbid flipped to a permit after signing, never loads.
+
 ### M-8: Worker environment carries nothing (E-2 precursor)
 
 ```bash
@@ -147,13 +157,14 @@ A phase is done when every line in its block is true on the reference host.
 - [x] `TestNoForbiddenImports` covers `cmd/agentd` and all of `internal/`
 - [x] `scripts/preflight.sh` passes on the reference host
 
-**Week 2 — Policy**
-- [ ] `internal/policy.Decide` evaluates `policies/*.rego` via embedded OPA; `Input`/`Decision` types unchanged
-- [ ] Policy bundle is Ed25519-signed and verified at startup like the manifest
-- [ ] L2 suite: five Rego test files, `opa test` green
-- [ ] Taint is raised by the governor when a tool result carries a sensitivity label; `TestTaintRaisedFromResult`
-- [ ] M-7 still passes with Rego in the loop
-- [ ] `TestNoForbiddenImports` updated to allow exactly the OPA module under `internal/policy` and nowhere else
+**Week 2 — Policy** (done 2026-11-10; Cedar instead of OPA, see PLAN.md)
+- [x] `internal/policy.Decide` evaluates `policies/*.cedar` via cedar-go; `Input`/`Decision` types unchanged
+- [x] Policies are Ed25519-signed and verified at startup like the manifest
+- [x] L2 suite: four attack-class files + engine properties, green on the reference host
+- [x] Taint is raised by the governor from the tool's declared `result_sensitivity`; shown in `make demo-week2`
+- [x] M-7 still passes with Cedar in the loop (`TestInjection_JustificationCannotExist` + stub worker week-1 sequence)
+- [x] `TestNoForbiddenImports` allows exactly `github.com/cedar-policy/cedar-go` under `internal/policy` and nowhere else
+- [x] New procedure M-9: tampered policy refused
 
 **Week 3 — Execution**
 - [ ] Per-execution Biscuit bound to tool, resource, args hash, 5 s TTL; `TestReplayWithDifferentArgsFails`

@@ -86,7 +86,14 @@ git add keys/manifest-signing.pub manifests/*.sig && git commit -m "sign manifes
 
 Then pull on the demo host. If you must do everything on one host for a PoC, that is acceptable as long as you say so; move `keys/private/` off the host afterwards.
 
-To change a manifest: edit the JSON, re-run `make sign-manifests`, commit both files. A manifest edited without re-signing will refuse to load, which you can demonstrate on purpose (test plan M-2).
+Policies are signed the same way, with the same key: `policies/*.cedar` each get a detached `.cedar.sig`.
+
+```bash
+make sign                    # = sign-manifests + sign-policies
+make verify                  # every manifest and policy must print "ok"
+```
+
+To change a manifest or a policy: edit it, `make sign`, commit both files. Anything edited without re-signing refuses to load, which you can demonstrate on purpose (test plan M-1, M-9). `make demo-*` checks signatures first and tells you to run `make sign` if they are stale.
 
 ## 5. Runtime layout
 
@@ -119,6 +126,7 @@ Flags:
 | Flag | Meaning |
 | --- | --- |
 | `-manifest`, `-pubkey` | The signed role and the key that signed it. Both required. |
+| `-policies` | Directory of signed `*.cedar` files (default `policies`). Every file must verify against `-pubkey`. |
 | `-audit` | Chain to append to. A new file per run keeps chains short and easy to hand over. Appending to an existing chain is supported; a corrupt existing chain is refused. |
 | `-kill-dir` | Any file appearing here stops the worker within 100 ms. `SIGUSR1` to `agentd` does the same. |
 | `-worker-user` | Drop the worker to this account. Requires `agentd` to start as root. Without it, the worker runs as the same user as the governor and `agentd` prints a warning: there is no boundary. |
@@ -206,13 +214,12 @@ tar czf agent-perimeter.tgz bin/ manifests/ keys/manifest-signing.pub client/ ag
 # move the tarball; on the target, extract and start from step 3
 ```
 
-No Go toolchain is needed on the target. **(week 2)** will add `go mod vendor` for the OPA dependency; the tarball approach still works because the binary is static.
+No Go toolchain is needed on the target. The one dependency (cedar-go) is vendored in the repository, so the build runs with `-mod=vendor` and never touches the network; the tarball approach works because the binary is static.
 
 ## 10. What is not deployed yet
 
 | Component | Week | Effect today |
 | --- | --- | --- |
-| Rego policy bundle | 2 | Policy is the Go function in `internal/policy`; same rules, not yet editable without a rebuild |
 | Executors, Biscuit tokens, Vault | 3 | Allowed calls return an echo of their args; nothing real runs |
 | Approval CLI | 3 | `approve` verdicts are returned to the worker as pending; nothing executes |
 | Worker container, executor netns, egress proxy | 4 | Boundary is UID + no environment; the worker still has host network |
@@ -224,7 +231,10 @@ No Go toolchain is needed on the target. **(week 2)** will add `go mod vendor` f
 | Symptom | Cause | Fix |
 | --- | --- | --- |
 | `refusing to start: manifest: signature does not verify` | Manifest edited after signing, or wrong public key | `make sign-manifests`; check `-pubkey` matches the signer |
-| `refusing to start: manifest: signature file missing` | No `.sig` beside the manifest | `make sign-manifests` |
+| `refusing to start: manifest: signature file missing` | No `.sig` beside the manifest | `make sign` |
+| `refusing to start: policy: signature does not verify` or `signature file missing` | A `.cedar` file was edited after signing, or never signed | `make sign` |
+| `refusing to start: policy: no .cedar files found` | Wrong `-policies` directory, or running from outside the repo | Pass `-policies /path/to/policies` |
+| `build cache is required, but could not be located` from `make test` | `$HOME` unset (non-login root shell) | `export HOME=/root`, or `sudo -i` |
 | `-worker-user requires agentd to be started as root` | Ran without sudo | `sudo bin/agentd run ...` |
 | `WARNING: running as root with the worker also as root` | No `-worker-user` | Add `-worker-user perimeter-worker` |
 | Worker prints nothing, governor exits with `request loop error ... sender UID does not match` | `-worker-uid` disagrees with the actual worker UID | Use `-worker-user` and let agentd set both |

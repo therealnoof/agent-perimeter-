@@ -4,7 +4,7 @@ Per-action authorization for AI agents, enforced by a Go governor the agent cann
 
 `agentd` sits between an untrusted agent process and every tool it wants to call. The agent proposes an action over a single inherited socket; the governor validates it, decides against signed policy, runs it (or not), and records the outcome in a hash-chained audit log. The agent holds no credentials, has no network, and cannot influence the decision with anything it says.
 
-**Status: week 1 of 6.** The governor skeleton is complete and tested. Not yet demo-ready for a customer; see [`docs/TESTPLAN.md`](docs/TESTPLAN.md) for exactly what is proven and what is not.
+**Status: week 2 of 6.** Governor skeleton and Cedar policy engine complete and tested on a real host. Not yet demo-ready for a customer; see [`docs/TESTPLAN.md`](docs/TESTPLAN.md) for exactly what is proven and what is not.
 
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — six diagrams: components and trust boundary, startup, request flow, policy decision, audit chain, shutdown
 - [`docs/DEPLOY.md`](docs/DEPLOY.md) — fresh-host install, worker account, signing, run, smoke test
@@ -30,13 +30,17 @@ Per-action authorization for AI agents, enforced by a Go governor the agent cann
 | A-4 structured refusal | `{verdict, reason_code, rule}` and nothing else | `stub_worker.py` output |
 | A-5 three identities | `originating_user`, `agent_role`, `approver_id` on every record | any audit line |
 
-Not yet: OPA/Rego (week 2), Biscuit tokens and real executors (week 3), sandbox and egress proxy (week 4), real agents (week 5), red-team harness (week 6).
+| P-1 signed policy | `policies/*.cedar` + detached `.sig`, verified before parse | `TestLoadRefusesTamperedPolicy` |
+| P-3 three verdicts | Cedar allow/deny + `@verdict("approve")` forbids; approve requires a matching permit | `TestApproveAnnotationSemantics`, `TestInjection_PublicChannelDenied` |
+| D-2 taint from source | `result_sensitivity` on the tool raises the task mark after it runs | `make demo-week2` |
+
+Not yet: Biscuit tokens and real executors (week 3), sandbox and egress proxy (week 4), real agents (week 5), red-team harness (week 6).
 
 ## Design decision: standard library only
 
 The governor imports nothing outside the Go standard library. Ed25519, `socketpair`, `SCM_CREDENTIALS`, SHA-256 and JSON are all in stdlib, and the request validator is a 200-line subset of JSON Schema written here rather than a dependency. For a component whose whole job is to be the trust anchor, "nothing to audit but this repo" is worth more than a richer schema language. `TestNoForbiddenImports` fails if anyone adds a module import to the binary. Manifests are JSON for the same reason.
 
-Week 2's OPA embed is the one planned exception and is confined to `internal/policy`.
+The one exception is the Cedar policy engine ([cedar-go](https://github.com/cedar-policy/cedar-go), two trivial transitive dependencies), vendored and permitted only under `internal/policy`. Why Cedar and not OPA is in [`docs/PLAN.md`](docs/PLAN.md).
 
 ## Quick start
 
@@ -88,7 +92,8 @@ cmd/sign-manifest/     operator tool: gen-key, sign, verify (offline)
 internal/manifest/     signed role description; refuses bad or missing signature
 internal/socket/       socketpair, fd 3 inheritance, SCM_CREDENTIALS sender check, length-prefixed frames
 internal/schema/       fixed request frame + JSON Schema subset for tool args
-internal/policy/       structural-facts-only decision; week 2 swaps in OPA
+internal/policy/       Cedar engine over signed policies; structural facts in, verdict + rule id out
+policies/              base.cedar (global forbids) + one <role>.cedar per role (permits), each with .sig
 internal/taskstate/    call counts, taint high-water mark, delegation depth
 internal/audit/        hash-chained JSONL writer and verifier
 client/perimeter_client/  Python: propose(tool, args, task_id) -> result | Denied | PendingApproval

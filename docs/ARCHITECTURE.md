@@ -30,7 +30,7 @@ flowchart LR
             S["internal/socket<br/>socketpair, SCM_CREDENTIALS"]
             SC["internal/schema<br/>frame + per-tool args"]
             TS["internal/taskstate<br/>call counts, taint HWM,<br/>delegation depth"]
-            P["internal/policy<br/>Decide(Input) → Decision"]
+            P["internal/policy<br/>Cedar: signed *.cedar<br/>Decide(Input) → Decision"]
             EX["execute()<br/>week-1 stub: echoes args"]
             A["internal/audit<br/>hash-chained JSONL"]
             KS["kill switch goroutine<br/>SIGUSR1 or file in -kill-dir"]
@@ -69,7 +69,7 @@ flowchart LR
 
 **Reading it.** Solid double arrow: the only channel the worker has. Dotted arrows: configuration the governor reads at startup. The worker has no network, no environment variables beyond `PATH`, no credentials, no view of the audit log, and no way to reach anything on the right side except by asking the governor over fd 3.
 
-**Stand-ins today.** `execute()` echoes the arguments back; week 3 replaces it with executors that hold a per-call token and a just-in-time credential. `internal/policy` is a Go function; week 2 replaces its body with a Cedar authorizer loading signed `.cedar` policies.
+**Stand-ins today.** `execute()` echoes the arguments back; week 3 replaces it with executors that hold a per-call token and a just-in-time credential. After a tool runs, the governor raises the task's taint mark to the tool's declared `result_sensitivity`, so §4's `taint_hwm` has a real source.
 
 ---
 
@@ -192,7 +192,7 @@ flowchart TD
 
 **Where each number comes from.** `role`, `kind`, `direction`, `sensitivity_floor`, `max_calls_per_task`, `max_delegation_depth`: the signed manifest. `call_count`, `taint_hwm`, `delegation_depth`: `internal/taskstate`, which only the governor writes. `tool known?`: whether the manifest has a tool by the requested name. Two tests pin this down: `TestInputCarriesNoAgentText` fails the build if a text-shaped field is ever added to `Input`, and `TestDeterministic` shows identical inputs give identical decisions.
 
-**Week 2.** The same decision, expressed as Cedar policies: `permit` statements for allowed tools, `forbid` statements for the floor and freeform rules. Cedar's `forbid`-overrides-`permit` semantics give the "only gets stricter" property as a language guarantee rather than an ordering convention.
+**As of week 2** the diagram above is realised in two layers. The first two diamonds (delegation depth, tool known) are Go pre-checks in `Engine.Decide`. Everything else is Cedar: `policies/base.cedar` holds the `forbid` rules (call cap, sensitivity floor, freeform outbound, delegation restated), `policies/<role>.cedar` holds one `permit` per tool with optional target constraints. The request is `principal = Agent::"<role>"`, `action = Action::"<tool>"`, `resource = Target::"<resource_arg value>"`, context = the facts listed in the input box. A `forbid` annotated `@verdict("approve")` yields APPROVE only if a permit would otherwise have matched; a plain `forbid` yields DENY; no matching permit yields DENY. Cedar's forbid-overrides-permit semantics give "only gets stricter" as a language guarantee rather than an ordering convention.
 
 ---
 
@@ -257,9 +257,7 @@ stateDiagram-v2
 
 | Piece | Week | Appears in diagram |
 | --- | --- | --- |
-| Cedar policy engine, signed policy bundle | 2 | Replaces the body of §4 |
 | Per-call Biscuit token, executors, Vault | 3 | Replaces `execute()` in §1 and §3; adds token id to §5 |
 | CLI approval gate, 60 s deny-by-default | 3 | Fills the `approve` branch in §3; fills `approver_id` in §5 |
-| Taint raised from labelled tool results | 2–3 | New arrow from executor result into `taskstate` in §1 |
 | Worker container, executor netns, egress proxy | 4 | Hardens the worker box in §1; adds the proxy |
 | Real agents, MCP bridge | 5 | Replaces `stub_worker.py` in §1 |

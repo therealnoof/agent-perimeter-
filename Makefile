@@ -14,7 +14,7 @@ PUBKEY    := $(KEYDIR)/manifest-signing.pub
 MANIFESTS := $(wildcard manifests/*.json)
 POLICIES  := $(wildcard policies/*.cedar)
 
-.PHONY: help build test gen-key sign-manifests sign-policies sign verify-manifests verify-policies verify clean demo-week1 demo-week2
+.PHONY: help build test check-signed gen-key sign-manifests sign-policies sign verify-manifests verify-policies verify clean demo-week1 demo-week2
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-18s %s\n", $$1, $$2}'
@@ -57,7 +57,15 @@ verify-manifests: build ## Verify every manifest signature against the committed
 		$(BIN)/sign-manifest verify -pub $(PUBKEY) -in $$m -sig $$m.sig && echo "ok      $$m"; \
 	done
 
-demo-week1: build ## Run agentd with the stub Python worker and show the audit chain
+# check-signed: fail fast with a useful message if a manifest or policy was
+# edited after signing. agentd would refuse anyway; this just says why.
+check-signed: build
+	@for m in $(MANIFESTS); do $(BIN)/sign-manifest verify -pub $(PUBKEY) -in $$m -sig $$m.sig >/dev/null 2>&1 \
+		|| { echo "$$m is not signed by $(PUBKEY). Run: make sign"; exit 1; }; done
+	@for p in $(POLICIES); do $(BIN)/sign-manifest verify -pub $(PUBKEY) -in $$p -sig $$p.sig >/dev/null 2>&1 \
+		|| { echo "$$p is not signed by $(PUBKEY). Run: make sign"; exit 1; }; done
+
+demo-week1: check-signed ## Run agentd with the stub Python worker and show the audit chain
 	@mkdir -p run
 	$(BIN)/agentd run -manifest manifests/stub-agent.json -pubkey $(PUBKEY) -audit run/audit.jsonl -- python3 agents/stub_worker.py
 	@echo "--- audit chain ---"
@@ -65,7 +73,7 @@ demo-week1: build ## Run agentd with the stub Python worker and show the audit c
 	@echo "--- verify ---"
 	$(BIN)/agentd verify -audit run/audit.jsonl
 
-demo-week2: build ## Staged-exfiltration demo: read confidential, then an ordinary update needs a human
+demo-week2: check-signed ## Staged-exfiltration demo: read confidential, then an ordinary update needs a human
 	@mkdir -p run
 	$(BIN)/agentd run -manifest manifests/stub-agent.json -pubkey $(PUBKEY) -audit run/audit2.jsonl -- python3 agents/stub_worker.py --week2
 	@echo "--- verdicts ---"
