@@ -16,10 +16,11 @@ const (
 	MaxJustificationBytes = 4 * 1024   // justification string
 	MaxToolNameBytes      = 64
 	MaxTaskIDBytes        = 128
+	MaxClientBytes        = 64
 )
 
 // Request is the fixed frame the agent sends. Nothing else is accepted.
-// Requirement G-4: {tool, args, task_id, justification}. The justification is
+// Requirement G-4: {tool, args, task_id, justification, client?}. The justification is
 // carried for the human approver's optional view only; it never reaches
 // policy (P-2) and this package never inspects its content.
 type Request struct {
@@ -27,6 +28,11 @@ type Request struct {
 	Args          json.RawMessage `json:"args"`
 	TaskID        string          `json:"task_id"`
 	Justification string          `json:"justification"`
+
+	// Client is the worker's self-description ("perimeter_client/0.3
+	// python/3.12"). Optional, bounded, and observational only: it goes to
+	// the audit record for fingerprinting and never to policy.
+	Client string `json:"client,omitempty"`
 }
 
 // ErrInvalid wraps every validation failure so callers can errors.Is on it.
@@ -60,6 +66,8 @@ func ParseRequest(raw []byte) (*Request, error) {
 		return nil, fmt.Errorf("%w: task_id too long", ErrInvalid)
 	case len(r.Justification) > MaxJustificationBytes:
 		return nil, fmt.Errorf("%w: justification exceeds %d bytes", ErrInvalid, MaxJustificationBytes)
+	case len(r.Client) > MaxClientBytes:
+		return nil, fmt.Errorf("%w: client exceeds %d bytes", ErrInvalid, MaxClientBytes)
 	case len(r.Args) == 0:
 		return nil, fmt.Errorf("%w: args is required", ErrInvalid)
 	}

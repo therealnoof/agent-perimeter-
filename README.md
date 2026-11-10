@@ -4,7 +4,7 @@ Per-action authorization for AI agents, enforced by a Go governor the agent cann
 
 `agentd` sits between an untrusted agent process and every tool it wants to call. The agent proposes an action over a single inherited socket; the governor validates it, decides against signed policy, runs it (or not), and records the outcome in a hash-chained audit log. The agent holds no credentials, has no network, and cannot influence the decision with anything it says.
 
-**Status: week 3 of 6.** Governor, Cedar policy, per-call tokens, executors, credential sidecar and the human approval gate are built and tested on a real host. Internal walkthrough-ready; customer demo needs weeks 4–6. Not yet demo-ready for a customer; see [`docs/TESTPLAN.md`](docs/TESTPLAN.md) for exactly what is proven and what is not.
+**Status: week 3 of 6, plus the dashboard.** Governor, Cedar policy, per-call tokens, executors, credential sidecar and the human approval gate are built and tested on a real host. Internal walkthrough-ready; customer demo needs weeks 4–6. Not yet demo-ready for a customer; see [`docs/TESTPLAN.md`](docs/TESTPLAN.md) for exactly what is proven and what is not.
 
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — six diagrams: components and trust boundary, startup, request flow, policy decision, audit chain, shutdown
 - [`docs/DEPLOY.md`](docs/DEPLOY.md) — fresh-host install, worker account, signing, run, smoke test
@@ -56,6 +56,7 @@ make sign-manifests   # writes manifests/*.json.sig
 make demo-week1       # verdict classes, call cap, schema rejection, justification retry
 make demo-week2       # staged exfiltration via taint
 make demo-week3       # real executors + credentials + an interactive approval prompt
+make auditview        # read-only dashboard on http://127.0.0.1:9800 (run alongside a demo)
 ```
 
 `make demo-week1` output ends with the stub worker hitting every verdict class:
@@ -105,6 +106,7 @@ internal/canon/        the one canonical args encoding everyone hashes
 cmd/executor/          one process per allowed call; verifies the token, fetches its credential, does the work
 cmd/secretsd/          credential sidecar: file or Vault backend, releases one secret per valid token
 cmd/mockserv/          Jira/Slack stand-in with bearer auth and a request log
+cmd/auditview/         read-only dashboard: traces, taint, approvals, credentials, behavioural profile
 policies/              base.cedar (global forbids) + one <role>.cedar per role (permits), each with .sig
 internal/taskstate/    call counts, taint high-water mark, delegation depth
 internal/audit/        hash-chained JSONL writer and verifier

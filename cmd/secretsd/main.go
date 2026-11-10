@@ -38,6 +38,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/therealnoof/agent-perimeter/internal/manifest"
 	"github.com/therealnoof/agent-perimeter/internal/tokens"
@@ -157,7 +158,7 @@ func handle(conn net.Conn, v *tokens.Verifier, paths map[string]string, b Backen
 
 	path, ok := paths[req.Tool]
 	if !ok {
-		log.Printf("secretsd: REFUSED tool=%s: no secret mapped", req.Tool)
+		logEvent("refused", req.Tool, "", "", "", "no secret for tool")
 		reply(response{Error: "no secret for tool"})
 		return
 	}
@@ -168,29 +169,52 @@ func handle(conn net.Conn, v *tokens.Verifier, paths map[string]string, b Backen
 	// token itself so Verify's binding check passes on those.
 	c, err := v.Parse(req.Token)
 	if err != nil {
-		log.Printf("secretsd: REFUSED tool=%s: %v", req.Tool, err)
+		logEvent("refused", req.Tool, "", "", path, err.Error())
 		reply(response{Error: err.Error()})
 		return
 	}
 	if _, err := v.Verify(req.Token, c.Tool, c.Target, c.ArgsHash); err != nil {
-		log.Printf("secretsd: REFUSED tool=%s jti=%s: %v", req.Tool, c.JTI, err)
+		logEvent("refused", req.Tool, c.TaskID, c.JTI, path, err.Error())
 		reply(response{Error: err.Error()})
 		return
 	}
 	if c.Tool != req.Tool {
-		log.Printf("secretsd: REFUSED tool=%s jti=%s: token is for %s", req.Tool, c.JTI, c.Tool)
+		logEvent("refused", req.Tool, c.TaskID, c.JTI, path, "token is for "+c.Tool)
 		reply(response{Error: "token is for a different tool"})
 		return
 	}
 
 	secret, err := b.Get(path)
 	if err != nil {
-		log.Printf("secretsd: backend error tool=%s path=%s: %v", req.Tool, path, err)
+		logEvent("error", req.Tool, c.TaskID, c.JTI, path, "backend: "+err.Error())
 		reply(response{Error: "backend: " + err.Error()})
 		return
 	}
-	log.Printf("secretsd: RELEASED tool=%s task=%s jti=%s path=%s", req.Tool, c.TaskID, c.JTI[:8], path)
+	logEvent("released", req.Tool, c.TaskID, c.JTI, path, "")
 	reply(response{OK: true, Secret: secret})
+}
+
+// logEvent writes one JSON line per decision to stderr, so the dashboard and
+// a SIEM can join it to the governor's audit chain on jti. Human-readable
+// enough to tail by eye as well.
+func logEvent(event, tool, task, jti, path, errMsg string) {
+	rec := map[string]any{
+		"ts": time.Now().UTC().Format(time.RFC3339Nano), "event": event, "tool": tool,
+	}
+	if task != "" {
+		rec["task_id"] = task
+	}
+	if jti != "" {
+		rec["token_id"] = jti
+	}
+	if path != "" {
+		rec["path"] = path
+	}
+	if errMsg != "" {
+		rec["error"] = errMsg
+	}
+	b, _ := json.Marshal(rec)
+	fmt.Fprintln(os.Stderr, string(b))
 }
 
 func loadGovPub(path string) (ed25519.PublicKey, error) {

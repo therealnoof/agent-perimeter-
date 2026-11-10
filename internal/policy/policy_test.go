@@ -79,7 +79,7 @@ func stubAgent(tool string) Input {
 // bounded; everything else text-shaped fails the build.
 func TestInputCarriesNoAgentText(t *testing.T) {
 	typ := reflect.TypeOf(Input{})
-	forbidden := []string{"justification", "args", "prompt", "message", "text", "body", "reason"}
+	forbidden := []string{"justification", "args", "prompt", "message", "text", "body", "reason", "client"}
 	for i := 0; i < typ.NumField(); i++ {
 		name := strings.ToLower(typ.Field(i).Name)
 		for _, f := range forbidden {

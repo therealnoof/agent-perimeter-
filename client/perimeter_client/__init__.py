@@ -23,11 +23,18 @@ from __future__ import annotations
 
 import json
 import os
+import platform
 import struct
 from dataclasses import dataclass
 from typing import Any
 
 __all__ = ["propose", "Denied", "PendingApproval", "NotUnderGovernor"]
+
+__version__ = "0.3"
+
+# Sent with every request as the "client" field. Observational only: the
+# governor records it for fingerprinting and never decides on it.
+CLIENT = f"perimeter_client/{__version__} python/{platform.python_version()}"
 
 
 class NotUnderGovernor(RuntimeError):
@@ -87,7 +94,7 @@ def propose(tool: str, args: dict[str, Any], task_id: str, justification: str = 
     """
     fd = _fd()
     frame = json.dumps(
-        {"tool": tool, "args": args, "task_id": task_id, "justification": justification},
+        {"tool": tool, "args": args, "task_id": task_id, "justification": justification, "client": CLIENT},
         separators=(",", ":"),
     ).encode()
     os.write(fd, struct.pack(">I", len(frame)) + frame)

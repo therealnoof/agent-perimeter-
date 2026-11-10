@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -193,8 +195,17 @@ func cmdRun(args []string) error {
 		executorBin: *executorBin, govPubPath: *govPubOut, secretsSock: *secretsSock, mockAddr: *mockAddr,
 	}
 
-	g.record(audit.Record{Event: "start", Detail: fmt.Sprintf("manifest=%s policies=%s worker_uid=%d dry_run=%v governor=%s approver=%s",
-		filepath.Base(*manifestPath), strings.Join(engine.Files(), ","), uid, *dryRun, tokens.Fingerprint(govPub)[:12], *approver)})
+	// Identity fingerprint of the worker we are about to start: the resolved
+	// executable and, if the first argument is a file, that file. Recorded,
+	// never decided on. A changed hash between runs is the operator's cue
+	// that the agent code changed.
+	exeHash, scriptHash := fingerprintWorker(workerCmd)
+	g.record(audit.Record{
+		Event: "start",
+		Detail: fmt.Sprintf("manifest=%s policies=%s worker_uid=%d dry_run=%v governor=%s approver=%s",
+			filepath.Base(*manifestPath), strings.Join(engine.Files(), ","), uid, *dryRun, tokens.Fingerprint(govPub)[:12], *approver),
+		WorkerCmd: strings.Join(workerCmd, " "), WorkerExeSHA256: exeHash, WorkerScriptSHA256: scriptHash,
+	})
 
 	// --- G-2: spawn the worker with its end of the socketpair on fd 3. ---
 	cmd := exec.Command(workerCmd[0], workerCmd[1:]...)
@@ -278,12 +289,34 @@ func (g *governor) serve(pair *socket.Pair) error {
 // handle is the whole decision path for one request, in order:
 // schema (G-4) -> policy (P-2/P-3) -> execute -> audit (A-2).
 func (g *governor) handle(raw []byte) response {
-	// G-4: the frame must be exactly {tool, args, task_id, justification}.
+	t0 := time.Now()
+	reqID := newReqID()
+	// Every record this request produces carries reqID and the stage timings
+	// known so far, so a reader can rebuild the span tree from the chain.
+	var tSchema, tPolicy, tApproval, tExec time.Duration
+	target := ""
+	jlen := 0
+	stamp := func(r audit.Record) audit.Record {
+		r.ReqID = reqID
+		if r.Target == "" {
+			r.Target = target
+		}
+		r.JustificationLen = jlen
+		r.SchemaUS, r.PolicyUS = tSchema.Microseconds(), tPolicy.Microseconds()
+		r.ApprovalMS, r.ExecMS = tApproval.Milliseconds(), tExec.Milliseconds()
+		r.TotalUS = time.Since(t0).Microseconds()
+		return r
+	}
+
+	// G-4: the frame must be exactly {tool, args, task_id, justification[, client]}.
 	req, err := schema.ParseRequest(raw)
 	if err != nil {
-		g.record(audit.Record{Event: "reject", Detail: err.Error(), ReasonCode: "schema"})
+		tSchema = time.Since(t0)
+		g.record(stamp(audit.Record{Event: "reject", Detail: err.Error(), ReasonCode: "schema"}))
 		return response{Verdict: "deny", ReasonCode: "schema_invalid"}
 	}
+
+	jlen = len(req.Justification)
 
 	// Hash the args once. Policy sees the hash; the audit record carries the
 	// hash; week 3's Biscuit binds to the hash. The args themselves go only to
@@ -294,10 +327,12 @@ func (g *governor) handle(raw []byte) response {
 	if tool != nil {
 		// Validate args against this tool's schema before policy runs.
 		if err := g.schemas[tool.Name].Validate(req.Args); err != nil {
-			g.record(audit.Record{Event: "reject", TaskID: req.TaskID, Tool: req.Tool, Detail: err.Error(), ReasonCode: "schema", ArgsHash: argsHash})
+			tSchema = time.Since(t0)
+			g.record(stamp(audit.Record{Event: "reject", TaskID: req.TaskID, Tool: req.Tool, Client: req.Client, Detail: err.Error(), ReasonCode: "schema", ArgsHash: argsHash}))
 			return response{Verdict: "deny", ReasonCode: "args_invalid"}
 		}
 	}
+	tSchema = time.Since(t0)
 
 	// Build the policy input from the manifest and task store. Note what is
 	// absent: req.Justification is never read, and req.Args contributes only
@@ -328,13 +363,16 @@ func (g *governor) handle(raw []byte) response {
 			in.Target = canon.StringField(req.Args, tool.ResourceArg)
 		}
 	}
+	target = in.Target
+	tp := time.Now()
 	d := g.engine.Decide(in)
+	tPolicy = time.Since(tp)
 
-	g.record(audit.Record{
-		Event: "verdict", TaskID: req.TaskID, Tool: req.Tool,
+	g.record(stamp(audit.Record{
+		Event: "verdict", TaskID: req.TaskID, Tool: req.Tool, Client: req.Client,
 		Verdict: string(d.Verdict), RuleFired: d.Rule, ReasonCode: d.ReasonCode,
 		TaintHWM: &taint, ArgsHash: argsHash, DryRun: g.dryRun,
-	})
+	}))
 
 	approverID := ""
 	switch d.Verdict {
@@ -349,15 +387,17 @@ func (g *governor) handle(raw []byte) response {
 		}
 		// A-3: a human sees structural facts and decides. The agent's
 		// justification is carried but hidden until asked for.
+		ta := time.Now()
 		out := g.approve.Ask(approval.Prompt{
 			TaskID: req.TaskID, Tool: req.Tool, Target: in.Target, TaintHWM: taint,
 			Rule: d.Rule, ArgsHash: argsHash, Justification: req.Justification,
 		})
-		g.record(audit.Record{
+		tApproval = time.Since(ta)
+		g.record(stamp(audit.Record{
 			Event: "approval", TaskID: req.TaskID, Tool: req.Tool, ArgsHash: argsHash,
 			ApproverID: out.ApproverID, ReasonCode: out.ReasonCode, RuleFired: d.Rule,
 			Verdict: map[bool]string{true: "approved", false: "declined"}[out.Approved],
-		})
+		}))
 		if !out.Approved {
 			return response{Verdict: "deny", ReasonCode: out.ReasonCode, Rule: d.Rule}
 		}
@@ -369,7 +409,9 @@ func (g *governor) handle(raw []byte) response {
 	// never inspected; a confidential ticket read is confidential whether or
 	// not the agent later reformats it.
 	g.tasks.RecordAllow(req.TaskID, req.Tool)
+	te := time.Now()
 	result, jti, exit, detail := g.execute(req, tool, in.Target, argsHash)
+	tExec = time.Since(te)
 	newTaint := taint
 	if tool != nil && exit == 0 {
 		// D-2: taint rises to the higher of the manifest's floor for this
@@ -384,10 +426,10 @@ func (g *governor) handle(raw []byte) response {
 			newTaint = g.tasks.RaiseTaint(req.TaskID, level)
 		}
 	}
-	g.record(audit.Record{
+	g.record(stamp(audit.Record{
 		Event: "executor", TaskID: req.TaskID, Tool: req.Tool, ArgsHash: argsHash,
 		TokenID: jti, ExitCode: &exit, TaintHWM: &newTaint, ApproverID: approverID, Detail: detail,
-	})
+	}))
 	if exit != 0 {
 		return response{Verdict: "deny", ReasonCode: "executor_failed", Rule: d.Rule}
 	}
@@ -441,6 +483,46 @@ func (g *governor) execute(req *schema.Request, tool *manifest.Tool, target, arg
 		return nil, jti, code, detail
 	}
 	return json.RawMessage(bytes.TrimSpace(stdout.Bytes())), jti, 0, detail
+}
+
+// newReqID returns 8 random bytes as hex: the span id for one request.
+func newReqID() string {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "00000000"
+	}
+	return hex.EncodeToString(b[:])
+}
+
+// fingerprintWorker hashes the worker's resolved executable and, when the
+// first argument names a readable file (a script), that file too. Empty
+// strings when a hash cannot be taken; never fatal.
+func fingerprintWorker(cmd []string) (exeHash, scriptHash string) {
+	if len(cmd) == 0 {
+		return "", ""
+	}
+	if path, err := exec.LookPath(cmd[0]); err == nil {
+		exeHash = fileSHA256(path)
+	}
+	if len(cmd) > 1 {
+		if st, err := os.Stat(cmd[1]); err == nil && st.Mode().IsRegular() {
+			scriptHash = fileSHA256(cmd[1])
+		}
+	}
+	return
+}
+
+func fileSHA256(path string) string {
+	f, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return ""
+	}
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 // reportedSensitivity reads the executor's "sensitivity" field, clamped 0-10.

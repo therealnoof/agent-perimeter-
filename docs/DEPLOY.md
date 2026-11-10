@@ -115,6 +115,26 @@ bin/mockserv -listen 127.0.0.1:9811 &             # Jira/Slack stand-in for the 
 
 `make services-up` / `make services-down` do this with pidfiles under `run/`.
 
+## 4c. The dashboard (`auditview`)
+
+A read-only page over the audit chain, the sidecar log and the mock's request log: trace timeline, span detail, taint over time, human decisions, credential releases joined to executor records, what reached the services, and a behavioural profile with anomaly flags. It never talks to the governor and is not part of the trust boundary.
+
+```bash
+make auditview                                   # http://127.0.0.1:9800, loopback only
+```
+
+From your laptop: `ssh -L 9800:127.0.0.1:9800 ubuntu@<host>` then open `http://localhost:9800`. That is the recommended way to view it: nothing listens on the network and no certificate is needed.
+
+For a room where others need to open it, bind a LAN address — the binary refuses a non-loopback bind without TLS:
+
+```bash
+make auditview-cert                              # self-signed, 30 days, run/auditview.crt + .key
+bin/auditview -listen 0.0.0.0:8443 -tls-cert run/auditview.crt -tls-key run/auditview.key \
+  -audit run/audit3.jsonl -secretsd-log run/secretsd.log -mock-addr 127.0.0.1:9811
+```
+
+8443 rather than 443 so it never needs root or `CAP_NET_BIND_SERVICE`. Open `https://<host>:8443` and accept the self-signed certificate.
+
 ## 5. Runtime layout
 
 ```bash

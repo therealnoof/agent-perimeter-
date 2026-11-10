@@ -87,6 +87,10 @@ func TestParseRequest(t *testing.T) {
 	if r.Tool != "jira_read" || r.TaskID != "t-1" {
 		t.Errorf("fields wrong: %+v", r)
 	}
+	withClient := `{"tool":"jira_read","args":{},"task_id":"t-1","justification":"","client":"perimeter_client/0.3"}`
+	if r, err := ParseRequest([]byte(withClient)); err != nil || r.Client != "perimeter_client/0.3" {
+		t.Errorf("client field: %v %+v", err, r)
+	}
 
 	bad := map[string]string{
 		"unknown field":      `{"tool":"x","args":{},"task_id":"t","justification":"","labels":{}}`,

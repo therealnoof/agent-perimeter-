@@ -31,7 +31,9 @@ type Record struct {
 	// What happened.
 	Event  string `json:"event"`             // e.g. "start", "request", "verdict", "executor", "kill", "stop"
 	TaskID string `json:"task_id,omitempty"` // the agent's task, when there is one
+	ReqID  string `json:"req_id,omitempty"`  // one request = one span; links verdict, approval, executor records
 	Tool   string `json:"tool,omitempty"`
+	Target string `json:"target,omitempty"` // the tool's bounded resource argument, or "-"
 	Detail string `json:"detail,omitempty"` // free-form but governor-authored; never agent text
 
 	// Decision fields, present on "verdict" events.
@@ -45,6 +47,25 @@ type Record struct {
 	// Executor outcome fields, present on "executor" events (A-2).
 	TokenID  string `json:"token_id,omitempty"`
 	ExitCode *int   `json:"exit_code,omitempty"`
+
+	// Timing, for tracing. Microseconds for in-process stages (the <5 ms
+	// budget), milliseconds for stages that wait on a human or a process.
+	SchemaUS   int64 `json:"t_schema_us,omitempty"`   // frame parse + args validation
+	PolicyUS   int64 `json:"t_policy_us,omitempty"`   // input build + Cedar evaluation
+	ApprovalMS int64 `json:"t_approval_ms,omitempty"` // human wait
+	ExecMS     int64 `json:"t_exec_ms,omitempty"`     // executor process, end to end
+	TotalUS    int64 `json:"t_total_us,omitempty"`    // frame in to reply out
+
+	// Shape of the agent's justification: its length in bytes. Never the
+	// text. A length that jumps after a denial is a persuasion signature.
+	JustificationLen int `json:"j_len,omitempty"`
+
+	// Worker identity, on "start" (who is on the other end of the socket).
+	// Observational: never a policy input.
+	Client             string `json:"client,omitempty"` // self-reported client library/version (on requests)
+	WorkerCmd          string `json:"worker_cmd,omitempty"`
+	WorkerExeSHA256    string `json:"worker_exe_sha256,omitempty"`    // hash of the resolved executable
+	WorkerScriptSHA256 string `json:"worker_script_sha256,omitempty"` // hash of the first argument if it is a file
 }
 
 // genesisHash is the prev_hash of the very first record.

@@ -98,6 +98,8 @@ func run(family, govPub, secretsSock, mockAddr string) int {
 		return fail(exitToken, "token rejected: %v", err)
 	}
 
+	callID = claims.JTI
+
 	// --- credential, if this tool has one ---
 	var secret map[string]any
 	if secretsSock != "" {

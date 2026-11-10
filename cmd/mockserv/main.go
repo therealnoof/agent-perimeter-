@@ -69,7 +69,7 @@ func auth(want string, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		got := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 		ok := got == want
-		record("%s %s auth=%s", r.Method, r.URL.Path, mask(got, ok))
+		record("%s %s auth=%s call=%s", r.Method, r.URL.Path, mask(got, ok), short(r.Header.Get("X-Perimeter-Call")))
 		if !ok {
 			http.Error(w, `{"error":"unauthorized"}`, 401)
 			return
@@ -121,6 +121,16 @@ func record(format string, a ...any) {
 	line := time.Now().Format("15:04:05.000") + " " + fmt.Sprintf(format, a...)
 	logLines = append(logLines, line)
 	log.Print(line)
+}
+
+func short(s string) string {
+	if len(s) > 8 {
+		return s[:8]
+	}
+	if s == "" {
+		return "-"
+	}
+	return s
 }
 
 func mask(tok string, ok bool) string {

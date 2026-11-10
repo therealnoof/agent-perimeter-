@@ -14,7 +14,7 @@ PUBKEY    := $(KEYDIR)/manifest-signing.pub
 MANIFESTS := $(wildcard manifests/*.json)
 POLICIES  := $(wildcard policies/*.cedar)
 
-.PHONY: help build test check-signed gov-key services-up services-down demo-week3 gen-key sign-manifests sign-policies sign verify-manifests verify-policies verify clean demo-week1 demo-week2
+.PHONY: help build test check-signed gov-key services-up services-down demo-week3 auditview auditview-cert gen-key sign-manifests sign-policies sign verify-manifests verify-policies verify clean demo-week1 demo-week2
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-18s %s\n", $$1, $$2}'
@@ -26,6 +26,7 @@ build: ## Build all binaries into ./bin
 	CGO_ENABLED=0 $(GO) build -trimpath -o $(BIN)/executor ./cmd/executor
 	CGO_ENABLED=0 $(GO) build -trimpath -o $(BIN)/secretsd ./cmd/secretsd
 	CGO_ENABLED=0 $(GO) build -trimpath -o $(BIN)/mockserv ./cmd/mockserv
+	CGO_ENABLED=0 $(GO) build -trimpath -o $(BIN)/auditview ./cmd/auditview
 
 test: ## Run all Go unit tests (race detector on)
 	$(GO) test -race -count=1 ./...
@@ -116,6 +117,7 @@ services-down: ## Stop mockserv and secretsd (by pidfile; never pkill -f, which 
 	done
 
 demo-week3: check-signed services-up ## Real executors + credentials + a human approval prompt (answer a/d/j on the terminal)
+	@echo "tip: in another terminal, 'make auditview' then open http://127.0.0.1:9800 (via ssh -L 9800:127.0.0.1:9800 if remote)"
 	$(BIN)/agentd run -manifest manifests/stub-agent.json -pubkey $(PUBKEY) -audit $(RUN)/audit3.jsonl \
 		-gov-key $(GOVKEY) -gov-pub-out $(GOVPUB) -executor $(BIN)/executor -secrets-sock $(SECSOCK) -mock-addr $(MOCKADDR) \
 		-approver cli -approval-timeout 60s -- python3 agents/stub_worker.py --week3
@@ -127,6 +129,20 @@ demo-week3: check-signed services-up ## Real executors + credentials + a human a
 	@grep -o '"event":"\(verdict\|approval\|executor\)".*"tool":"[a-z_]*"' $(RUN)/audit3.jsonl | sed 's/"originating_user[^,]*,"agent_role[^,]*,//' | cut -c1-160
 	$(BIN)/agentd verify -audit $(RUN)/audit3.jsonl
 	@$(MAKE) -s services-down
+
+# --- dashboard -------------------------------------------------------------------
+AV_LISTEN ?= 127.0.0.1:9800
+AV_AUDIT  ?= $(RUN)/audit3.jsonl
+
+auditview: build ## Serve the read-only dashboard on $(AV_LISTEN) (loopback; tunnel with: ssh -L 9800:127.0.0.1:9800 user@host)
+	@mkdir -p $(RUN); touch $(AV_AUDIT)
+	$(BIN)/auditview -listen $(AV_LISTEN) -audit $(AV_AUDIT) -secretsd-log $(RUN)/secretsd.log -mock-addr $(MOCKADDR)
+
+auditview-cert: ## Self-signed cert for serving the dashboard on a LAN: make auditview AV_LISTEN=0.0.0.0:8443 AV_TLS=1
+	@mkdir -p $(RUN)
+	openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 30 \
+		-keyout $(RUN)/auditview.key -out $(RUN)/auditview.crt -subj "/CN=agentd-auditview" 2>/dev/null
+	@echo "wrote $(RUN)/auditview.crt and .key; run: $(BIN)/auditview -listen 0.0.0.0:8443 -tls-cert $(RUN)/auditview.crt -tls-key $(RUN)/auditview.key -audit $(AV_AUDIT) -secretsd-log $(RUN)/secretsd.log -mock-addr $(MOCKADDR)"
 
 clean: ## Remove build outputs and runtime state
 	rm -rf $(BIN) run

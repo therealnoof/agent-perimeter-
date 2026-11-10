@@ -93,6 +93,10 @@ func reportSensitivity(n int) {
 
 var client = &http.Client{Timeout: 5 * time.Second}
 
+// callID is the token's jti, set by main, sent to the service as a header so
+// the service's own log can be joined to the governor's audit record.
+var callID string
+
 func call(method, url, bearer string, body any) (any, error) {
 	var rd io.Reader
 	if body != nil {
@@ -104,6 +108,9 @@ func call(method, url, bearer string, body any) (any, error) {
 		return nil, err
 	}
 	req.Header.Set("Authorization", "Bearer "+bearer)
+	if callID != "" {
+		req.Header.Set("X-Perimeter-Call", callID)
+	}
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
