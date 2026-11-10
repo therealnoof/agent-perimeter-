@@ -58,6 +58,20 @@ type Tool struct {
 	// token for this tool. Empty means the tool needs no credential.
 	SecretPath string `json:"secret_path,omitempty"`
 
+	// EgressHosts is the list of host:port this tool's executor may connect
+	// to, enforced by the egress proxy (E-4). An executor sandbox has no
+	// network interfaces; the proxy is its only way out, and it checks this
+	// list against the tool named in the per-call token. Empty means no
+	// network at all.
+	EgressHosts []string `json:"egress_hosts,omitempty"`
+
+	// Redact lists result fields (top-level keys of the family's result
+	// object) the governor replaces with a placeholder before the worker
+	// sees them (D-4 ingress). The agent can refer to the field, carry the
+	// placeholder around, even try to send it; it cannot read the value
+	// without the detokenize tool, which always needs a human.
+	Redact []string `json:"redact,omitempty"`
+
 	// ResourceArg names the args field whose value becomes the Cedar
 	// `resource` (Target::"<value>") so policy can say "this channel but not
 	// that one". The field's schema must be a string bounded by enum or

@@ -42,3 +42,14 @@ permit (
   action == Action::"slack_post",
   resource == Target::"#triage-internal"
 );
+
+// detokenize: read back a field the governor redacted on the way in.
+// Permitted, but base.cedar's flow.detokenize forbid makes every use a
+// human decision, so the agent can refer to redacted data freely and read
+// it only with someone watching.
+@id("stub.detokenize")
+permit (
+  principal == Agent::"stub-agent",
+  action == Action::"detokenize",
+  resource
+);

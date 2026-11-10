@@ -24,6 +24,7 @@ import (
 	"github.com/therealnoof/agent-perimeter/internal/approval"
 	"github.com/therealnoof/agent-perimeter/internal/audit"
 	"github.com/therealnoof/agent-perimeter/internal/canon"
+	"github.com/therealnoof/agent-perimeter/internal/egressscan"
 	"github.com/therealnoof/agent-perimeter/internal/manifest"
 	"github.com/therealnoof/agent-perimeter/internal/policy"
 	"github.com/therealnoof/agent-perimeter/internal/schema"
@@ -51,6 +52,7 @@ type governor struct {
 	engine  *policy.Engine            // signed Cedar policies, loaded at startup
 	minter  *tokens.Minter            // per-call token signer (C-1)
 	approve approval.Approver         // human gate for "approve" verdicts (A-3)
+	scanner *egressscan.Scanner       // outbound-args scan; knows every value the governor issued (D-4)
 	tasks   *taskstate.Store
 	log     *audit.Writer
 	user    string // originating_user for every audit record
@@ -60,6 +62,7 @@ type governor struct {
 	executorBin string
 	govPubPath  string
 	secretsSock string
+	egressSock  string
 	mockAddr    string
 }
 
@@ -77,6 +80,7 @@ func cmdRun(args []string) error {
 	govPubOut := fs.String("gov-pub-out", "run/governor.pub", "where to write the governor public key for executors and secretsd")
 	executorBin := fs.String("executor", "bin/executor", "executor binary spawned per allowed call")
 	secretsSock := fs.String("secrets-sock", "", "secretsd socket passed to executors (empty: tools with secrets will fail)")
+	egressSock := fs.String("egress-sock", "", "egress-proxy socket passed to executors (empty: executors dial directly)")
 	mockAddr := fs.String("mock-addr", "127.0.0.1:9811", "mock service address passed to executors")
 	approver := fs.String("approver", "cli", "who answers approve verdicts: cli | deny | allow-all-UNSAFE-tests-only")
 	approvalTimeout := fs.Duration("approval-timeout", approval.DefaultTimeout, "how long a CLI prompt waits before deny")
@@ -191,8 +195,8 @@ func cmdRun(args []string) error {
 
 	g := &governor{
 		man: man, schemas: schemas, engine: engine, tasks: taskstate.New(), log: log, user: me, dryRun: *dryRun,
-		minter: tokens.NewMinter(govPriv, 0), approve: appr,
-		executorBin: *executorBin, govPubPath: *govPubOut, secretsSock: *secretsSock, mockAddr: *mockAddr,
+		minter: tokens.NewMinter(govPriv, 0), approve: appr, scanner: egressscan.New(),
+		executorBin: *executorBin, govPubPath: *govPubOut, secretsSock: *secretsSock, egressSock: *egressSock, mockAddr: *mockAddr,
 	}
 
 	// Identity fingerprint of the worker we are about to start: the resolved
@@ -364,15 +368,35 @@ func (g *governor) handle(raw []byte) response {
 		}
 	}
 	target = in.Target
+
+	// D-4 egress: scan the arguments of outbound tools for credential shapes
+	// and for values the governor itself issued. The result is a policy
+	// fact; base.cedar decides what it means. The justification is never
+	// scanned: it goes nowhere.
+	var scan egressscan.Report
+	if tool != nil && tool.Direction == manifest.DirOutbound {
+		scan = g.scanner.Scan(req.Args)
+		in.EgressHit = string(scan.Level)
+	}
+
 	tp := time.Now()
 	d := g.engine.Decide(in)
 	tPolicy = time.Since(tp)
 
-	g.record(stamp(audit.Record{
+	vr := audit.Record{
 		Event: "verdict", TaskID: req.TaskID, Tool: req.Tool, Client: req.Client,
 		Verdict: string(d.Verdict), RuleFired: d.Rule, ReasonCode: d.ReasonCode,
 		TaintHWM: &taint, ArgsHash: argsHash, DryRun: g.dryRun,
-	}))
+	}
+	if scan.Level != "" && scan.Level != egressscan.None {
+		// Rule names and field paths only; never the matched value.
+		var parts []string
+		for _, h := range scan.Hits {
+			parts = append(parts, h.Rule+"@"+h.Path)
+		}
+		vr.Detail = "egress_scan=" + string(scan.Level) + " " + strings.Join(parts, ",")
+	}
+	g.record(stamp(vr))
 
 	approverID := ""
 	switch d.Verdict {
@@ -454,6 +478,14 @@ func (g *governor) execute(req *schema.Request, tool *manifest.Tool, target, arg
 	if err != nil {
 		return nil, "", 1, "mint: " + err.Error()
 	}
+	// Token ids are governor-issued values: if one ever shows up in
+	// outbound arguments, the worker is trying to pass a capability along.
+	g.scanner.AddActive(jti, "token")
+
+	// Tools the governor serves itself: no executor, no credential.
+	if tool.Executor == "governor" {
+		return g.builtin(req, tool, target)
+	}
 
 	job, _ := json.Marshal(map[string]any{
 		"token": tok, "tool": req.Tool, "target": target, "args": req.Args,
@@ -461,6 +493,9 @@ func (g *governor) execute(req *schema.Request, tool *manifest.Tool, target, arg
 	args := []string{"-family", tool.Executor, "-gov-pub", g.govPubPath, "-mock-addr", g.mockAddr}
 	if g.secretsSock != "" {
 		args = append(args, "-secrets-sock", g.secretsSock)
+	}
+	if g.egressSock != "" {
+		args = append(args, "-egress-sock", g.egressSock)
 	}
 	cmd := exec.Command(g.executorBin, args...)
 	cmd.Stdin = bytes.NewReader(job)
@@ -482,7 +517,68 @@ func (g *governor) execute(req *schema.Request, tool *manifest.Tool, target, arg
 	if code != 0 {
 		return nil, jti, code, detail
 	}
-	return json.RawMessage(bytes.TrimSpace(stdout.Bytes())), jti, 0, detail
+	out := json.RawMessage(bytes.TrimSpace(stdout.Bytes()))
+	if len(tool.Redact) > 0 {
+		out = g.redact(req.TaskID, out, tool.Redact)
+	}
+	return out, jti, 0, detail
+}
+
+// redact replaces the named top-level fields of the family's result object
+// with placeholders before the worker sees them (D-4 ingress). The original
+// values are kept per task for the detokenize tool, and every placeholder
+// is registered as an active value so the scanner catches it on the way
+// out. The envelope around the result is left alone.
+func (g *governor) redact(taskID string, env json.RawMessage, fields []string) json.RawMessage {
+	var outer map[string]json.RawMessage
+	if json.Unmarshal(env, &outer) != nil {
+		return env
+	}
+	var result map[string]json.RawMessage
+	if json.Unmarshal(outer["result"], &result) != nil {
+		return env
+	}
+	changed := false
+	for _, f := range fields {
+		raw, ok := result[f]
+		if !ok {
+			continue
+		}
+		var val string
+		if json.Unmarshal(raw, &val) != nil {
+			val = string(raw) // non-string: redact its JSON text
+		}
+		var b [4]byte
+		rand.Read(b[:])
+		tokID := "tok_" + hex.EncodeToString(b[:])
+		placeholder := "[redacted:" + tokID + "]"
+		g.tasks.AddRedaction(taskID, tokID, val)
+		g.scanner.AddActive(placeholder, "redaction")
+		g.scanner.AddActive(tokID, "redaction")
+		result[f], _ = json.Marshal(placeholder)
+		changed = true
+	}
+	if !changed {
+		return env
+	}
+	outer["result"], _ = json.Marshal(result)
+	out, _ := json.Marshal(outer)
+	return out
+}
+
+// builtin serves the tools the governor implements itself. Today that is
+// only detokenize, and it only ever runs after a human approved it, because
+// base.cedar routes every detokenize call to approval.
+func (g *governor) builtin(req *schema.Request, tool *manifest.Tool, target string) (json.RawMessage, string, int, string) {
+	switch tool.Name {
+	case "detokenize":
+		val, ok := g.tasks.Redaction(req.TaskID, target)
+		if !ok {
+			return nil, "", 4, "no such redaction in this task"
+		}
+		return mustJSON(map[string]any{"ok": true, "tool": "detokenize", "result": map[string]any{"token": target, "value": val}}), "", 0, "governor"
+	}
+	return nil, "", 1, "unknown builtin " + tool.Name
 }
 
 // newReqID returns 8 random bytes as hex: the span id for one request.

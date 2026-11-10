@@ -66,6 +66,11 @@ type Input struct {
 
 	// About the request. ArgsHash is the hex SHA-256 of the canonical args.
 	ArgsHash string
+
+	// EgressHit is the strongest egress-scan level found in the args of an
+	// OUTBOUND tool: "none", "low", "high" or "active". Computed by the
+	// governor (internal/egressscan); the scan never sees the justification.
+	EgressHit string
 }
 
 // Decision is the verdict plus which rule produced it, for the audit record.
@@ -266,6 +271,11 @@ func buildContext(in Input) types.Record {
 	if in.SensitivityFloor != nil {
 		m["sensitivity_floor"] = types.Long(*in.SensitivityFloor)
 	}
+	hit := in.EgressHit
+	if hit == "" {
+		hit = "none"
+	}
+	m["egress_hit"] = types.String(hit)
 	return cedar.NewRecord(m)
 }
 

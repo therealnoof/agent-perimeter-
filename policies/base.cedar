@@ -46,3 +46,30 @@ when { context has sensitivity_floor && context.taint_hwm >= context.sensitivity
 @verdict("approve")
 forbid (principal, action, resource)
 when { context.kind == "freeform" && context.direction == "outbound" };
+
+// D-4 / exfiltration: the governor scans the arguments of every OUTBOUND
+// tool for things that must not leave. Three levels:
+//   active  a value the governor itself issued (a redaction placeholder,
+//           one of its token ids) — certain, never overridable
+//   high    a distinctive credential shape (AWS key, GitHub token, PEM
+//           private key, bearer in a URL) — never overridable
+//   low     a generic secret-looking shape — a human decides
+@id("egress.active")
+forbid (principal, action, resource)
+when { context.egress_hit == "active" };
+
+@id("egress.high_confidence")
+forbid (principal, action, resource)
+when { context.egress_hit == "high" };
+
+@id("egress.low_confidence")
+@verdict("approve")
+forbid (principal, action, resource)
+when { context.egress_hit == "low" };
+
+// D-4 / ingress: reading back a value the governor redacted is itself a
+// tool call, and it always goes to a human. A role file may permit the
+// detokenize tool; it can never make it silent.
+@id("flow.detokenize")
+@verdict("approve")
+forbid (principal, action == Action::"detokenize", resource);

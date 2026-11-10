@@ -29,6 +29,12 @@
       "direction": "inbound",
       "resource_arg": "ticket_id",
       "secret_path": "demo/jira",
+      "egress_hosts": [
+        "127.0.0.1:9811"
+      ],
+      "redact": [
+        "summary"
+      ],
       "result_sensitivity": 1,
       "args_schema": {
         "type": "object",
@@ -50,6 +56,9 @@
       "direction": "outbound",
       "resource_arg": "ticket_id",
       "secret_path": "demo/jira",
+      "egress_hosts": [
+        "127.0.0.1:9811"
+      ],
       "sensitivity_floor": 7,
       "args_schema": {
         "type": "object",
@@ -79,6 +88,9 @@
       "direction": "outbound",
       "resource_arg": "channel",
       "secret_path": "demo/slack",
+      "egress_hosts": [
+        "127.0.0.1:9811"
+      ],
       "args_schema": {
         "type": "object",
         "properties": {
@@ -99,6 +111,25 @@
           "text"
         ]
       }
+    },
+    {
+      "name": "detokenize",
+      "executor": "governor",
+      "kind": "structured",
+      "direction": "inbound",
+      "resource_arg": "token",
+      "args_schema": {
+        "type": "object",
+        "properties": {
+          "token": {
+            "type": "string",
+            "pattern": "^tok_[0-9a-f]{8}$"
+          }
+        },
+        "required": [
+          "token"
+        ]
+      }
     }
   ]
-}\n
+}

@@ -26,6 +26,7 @@ build: ## Build all binaries into ./bin
 	CGO_ENABLED=0 $(GO) build -trimpath -o $(BIN)/executor ./cmd/executor
 	CGO_ENABLED=0 $(GO) build -trimpath -o $(BIN)/secretsd ./cmd/secretsd
 	CGO_ENABLED=0 $(GO) build -trimpath -o $(BIN)/mockserv ./cmd/mockserv
+	CGO_ENABLED=0 $(GO) build -trimpath -o $(BIN)/egress-proxy ./cmd/egress-proxy
 	CGO_ENABLED=0 $(GO) build -trimpath -o $(BIN)/auditview ./cmd/auditview
 
 test: ## Run all Go unit tests (race detector on)
@@ -94,32 +95,36 @@ RUN       := run
 GOVKEY    := $(RUN)/governor.key
 GOVPUB    := $(RUN)/governor.pub
 SECSOCK   := $(RUN)/secrets.sock
+EGRSOCK   := $(RUN)/egress.sock
 MOCKADDR  := 127.0.0.1:9811
 
 gov-key: build ## Generate the governor token-signing key if it does not exist (run/governor.key, mode 0600)
 	@mkdir -p $(RUN)
 	@[ -f $(GOVKEY) ] || $(BIN)/agentd keygen -out $(GOVKEY) -pub-out $(GOVPUB)
 
-services-up: build gov-key ## Start mockserv and secretsd in the background (logs and pidfiles in run/)
+services-up: build gov-key ## Start mockserv, secretsd and egress-proxy in the background (logs and pidfiles in run/)
 	@mkdir -p $(RUN)
 	@chmod 600 deploy/secrets.demo.json
 	@$(MAKE) -s services-down
 	@$(BIN)/mockserv -listen $(MOCKADDR) >$(RUN)/mockserv.log 2>&1 & echo $$! > $(RUN)/mockserv.pid; echo "mockserv  on $(MOCKADDR) (pid $$!)"
 	@$(BIN)/secretsd -listen $(SECSOCK) -gov-pub $(GOVPUB) -manifest manifests/stub-agent.json -pubkey $(PUBKEY) \
 		-secrets-file deploy/secrets.demo.json >$(RUN)/secretsd.log 2>&1 & echo $$! > $(RUN)/secretsd.pid; echo "secretsd  on $(SECSOCK) (pid $$!)"
+	@$(BIN)/egress-proxy -listen $(EGRSOCK) -gov-pub $(GOVPUB) -manifest manifests/stub-agent.json -pubkey $(PUBKEY) \
+		>$(RUN)/egress-proxy.log 2>&1 & echo $$! > $(RUN)/egress-proxy.pid; echo "egress-proxy on $(EGRSOCK) (pid $$!)"
 	@sleep 0.5
+	@kill -0 $$(cat $(RUN)/egress-proxy.pid) 2>/dev/null || { echo "egress-proxy failed to start:"; cat $(RUN)/egress-proxy.log; exit 1; }
 	@kill -0 $$(cat $(RUN)/mockserv.pid) 2>/dev/null || { echo "mockserv failed to start:"; cat $(RUN)/mockserv.log; exit 1; }
 	@kill -0 $$(cat $(RUN)/secretsd.pid) 2>/dev/null || { echo "secretsd failed to start:"; cat $(RUN)/secretsd.log; exit 1; }
 
-services-down: ## Stop mockserv and secretsd (by pidfile; never pkill -f, which matches this recipe's own shell)
-	@for s in mockserv secretsd; do \
+services-down: ## Stop mockserv, secretsd and egress-proxy (by pidfile; never pkill -f, which matches this recipe's own shell)
+	@for s in mockserv secretsd egress-proxy; do \
 		if [ -f $(RUN)/$$s.pid ]; then kill $$(cat $(RUN)/$$s.pid) 2>/dev/null; rm -f $(RUN)/$$s.pid; fi; \
 	done
 
 demo-week3: check-signed services-up ## Real executors + credentials + a human approval prompt (answer a/d/j on the terminal)
 	@echo "tip: in another terminal, 'make auditview' then open https://<this-host>:9800"
 	$(BIN)/agentd run -manifest manifests/stub-agent.json -pubkey $(PUBKEY) -audit $(RUN)/audit3.jsonl \
-		-gov-key $(GOVKEY) -gov-pub-out $(GOVPUB) -executor $(BIN)/executor -secrets-sock $(SECSOCK) -mock-addr $(MOCKADDR) \
+		-gov-key $(GOVKEY) -gov-pub-out $(GOVPUB) -executor $(BIN)/executor -secrets-sock $(SECSOCK) -egress-sock $(EGRSOCK) -mock-addr $(MOCKADDR) \
 		-approver cli -approval-timeout 60s -- python3 agents/stub_worker.py --week3
 	@echo "--- what reached the mock service ---"
 	@curl -s http://$(MOCKADDR)/log

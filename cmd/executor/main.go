@@ -66,12 +66,13 @@ func main() {
 	family := flag.String("family", "", "tool family: echo | jira | slack")
 	govPub := flag.String("gov-pub", "", "governor public key file (hex Ed25519)")
 	secretsSock := flag.String("secrets-sock", "", "secrets sidecar socket; required for tools with a secret")
+	egressSock := flag.String("egress-sock", "", "egress proxy socket; when set, every outbound TCP connection goes through it")
 	mockAddr := flag.String("mock-addr", "127.0.0.1:9811", "mock service address for jira/slack families")
 	flag.Parse()
-	os.Exit(run(*family, *govPub, *secretsSock, *mockAddr))
+	os.Exit(run(*family, *govPub, *secretsSock, *egressSock, *mockAddr))
 }
 
-func run(family, govPub, secretsSock, mockAddr string) int {
+func run(family, govPub, secretsSock, egressSock, mockAddr string) int {
 	fail := func(code int, format string, a ...any) int {
 		fmt.Fprintf(os.Stderr, "executor: "+format+"\n", a...)
 		return code
@@ -99,6 +100,11 @@ func run(family, govPub, secretsSock, mockAddr string) int {
 	}
 
 	callID = claims.JTI
+	if egressSock != "" {
+		// Inside the sandbox there are no interfaces; the proxy socket is
+		// the only route, and it wants our token with every CONNECT.
+		useEgressProxy(egressSock, j.Token)
+	}
 
 	// --- credential, if this tool has one ---
 	var secret map[string]any

@@ -1,12 +1,16 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -92,6 +96,46 @@ func reportSensitivity(n int) {
 // --- shared HTTP helper -------------------------------------------------------------
 
 var client = &http.Client{Timeout: 5 * time.Second}
+
+// useEgressProxy routes every connection the families make through the
+// egress proxy's Unix socket: dial the socket, send CONNECT host:port with
+// the governor token, and hand the established stream to net/http as if it
+// were a direct connection. Works for http:// and https:// targets alike.
+func useEgressProxy(sock, token string) {
+	client.Transport = &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			c, err := net.Dial("unix", sock)
+			if err != nil {
+				return nil, fmt.Errorf("egress proxy: %w", err)
+			}
+			fmt.Fprintf(c, "CONNECT %s HTTP/1.1\r\nHost: %s\r\nProxy-Authorization: Bearer %s\r\n\r\n", addr, addr, token)
+			br := bufio.NewReader(c)
+			resp, err := http.ReadResponse(br, &http.Request{Method: http.MethodConnect})
+			if err != nil {
+				c.Close()
+				return nil, fmt.Errorf("egress proxy: %w", err)
+			}
+			if resp.StatusCode != 200 {
+				body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+				c.Close()
+				return nil, fmt.Errorf("egress proxy refused %s: %s", addr, strings.TrimSpace(string(body)))
+			}
+			// Nothing should be buffered past the 200, but keep it safe.
+			if br.Buffered() > 0 {
+				return &bufConn{Conn: c, r: br}, nil
+			}
+			return c, nil
+		},
+		DisableKeepAlives: true, // one call, one connection
+	}
+}
+
+type bufConn struct {
+	net.Conn
+	r *bufio.Reader
+}
+
+func (b *bufConn) Read(p []byte) (int, error) { return b.r.Read(p) }
 
 // callID is the token's jti, set by main, sent to the service as a header so
 // the service's own log can be joined to the governor's audit record.

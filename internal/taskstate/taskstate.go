@@ -21,6 +21,11 @@ type Task struct {
 	// Delegation (G-8). ParentTaskID is empty for a root task.
 	ParentTaskID    string
 	DelegationDepth int
+
+	// redactions maps placeholder token -> original value for fields the
+	// governor redacted on the way in (D-4). Only the governor reads it, and
+	// only through the human-gated detokenize tool.
+	redactions map[string]string
 }
 
 // Store holds all live tasks. Safe for concurrent use.
@@ -83,6 +88,25 @@ func (s *Store) RaiseTaint(taskID string, level int) int {
 		t.taintHWM = level
 	}
 	return t.taintHWM
+}
+
+// AddRedaction remembers the original value behind a placeholder.
+func (s *Store) AddRedaction(taskID, token, value string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	t := s.get(taskID)
+	if t.redactions == nil {
+		t.redactions = map[string]string{}
+	}
+	t.redactions[token] = value
+}
+
+// Redaction returns the value behind a placeholder, if this task has it.
+func (s *Store) Redaction(taskID, token string) (string, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	v, ok := s.get(taskID).redactions[token]
+	return v, ok
 }
 
 // Elapsed returns how long the task has been running.

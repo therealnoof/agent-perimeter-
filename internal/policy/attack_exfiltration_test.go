@@ -55,3 +55,48 @@ func TestExfil_FreeformInboundAllowed(t *testing.T) {
 		t.Fatalf("got %+v", d)
 	}
 }
+
+// D-4 egress: a credential shape in an outbound call is a hard deny; a
+// generic shape is a human decision; a governor-issued value is a hard deny
+// even on a fully permitted call.
+func TestExfil_EgressScanLevels(t *testing.T) {
+	e := loadRepoPolicies(t)
+	in := stubAgent("jira_update")
+	in.Target = "OPS-1"
+	in.EgressHit = "high"
+	if d := e.Decide(in); d.Verdict != Deny || d.Rule != "egress.high_confidence" {
+		t.Fatalf("high: got %+v", d)
+	}
+	in.EgressHit = "active"
+	if d := e.Decide(in); d.Verdict != Deny || d.Rule != "egress.active" {
+		t.Fatalf("active: got %+v", d)
+	}
+	in.EgressHit = "low"
+	if d := e.Decide(in); d.Verdict != Approve || d.Rule != "egress.low_confidence" {
+		t.Fatalf("low: got %+v", d)
+	}
+	in.EgressHit = "none"
+	if d := e.Decide(in); d.Verdict != Allow {
+		t.Fatalf("none: got %+v", d)
+	}
+}
+
+// A high hit beats an overridable floor: when both fire, nobody can approve.
+func TestExfil_HighHitNotOverridableEvenWithFloor(t *testing.T) {
+	e := loadRepoPolicies(t)
+	in := stubAgent("jira_update")
+	in.Target, in.TaintHWM, in.EgressHit = "OPS-1", 9, "high"
+	if d := e.Decide(in); d.Verdict != Deny {
+		t.Fatalf("got %+v", d)
+	}
+}
+
+// D-4 ingress: detokenize is permitted for the role but always a human call.
+func TestExfil_DetokenizeAlwaysNeedsHuman(t *testing.T) {
+	e := loadRepoPolicies(t)
+	in := stubAgent("jira_read") // borrow structured/inbound shape
+	in.ToolName, in.Target = "detokenize", "tok_9f2a7c1e"
+	if d := e.Decide(in); d.Verdict != Approve || d.Rule != "flow.detokenize" {
+		t.Fatalf("got %+v", d)
+	}
+}
