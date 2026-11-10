@@ -5,58 +5,99 @@
   "tools": [
     {
       "name": "echo",
+      "executor": "echo",
       "kind": "structured",
       "direction": "inbound",
       "max_calls_per_task": 3,
       "args_schema": {
         "type": "object",
         "properties": {
-          "msg": {"type": "string", "maxLength": 200}
+          "msg": {
+            "type": "string",
+            "maxLength": 200
+          }
         },
-        "required": ["msg"]
+        "required": [
+          "msg"
+        ]
       }
     },
     {
       "name": "jira_read",
+      "executor": "jira",
       "kind": "structured",
       "direction": "inbound",
       "resource_arg": "ticket_id",
+      "secret_path": "demo/jira",
       "result_sensitivity": 8,
       "args_schema": {
         "type": "object",
         "properties": {
-          "ticket_id": {"type": "string", "pattern": "^[A-Z]+-[0-9]+$"}
+          "ticket_id": {
+            "type": "string",
+            "pattern": "^[A-Z]+-[0-9]+$"
+          }
         },
-        "required": ["ticket_id"]
+        "required": [
+          "ticket_id"
+        ]
       }
     },
     {
       "name": "jira_update",
+      "executor": "jira",
       "kind": "structured",
       "direction": "outbound",
       "resource_arg": "ticket_id",
+      "secret_path": "demo/jira",
       "sensitivity_floor": 7,
       "args_schema": {
         "type": "object",
         "properties": {
-          "ticket_id": {"type": "string", "pattern": "^[A-Z]+-[0-9]+$"},
-          "status": {"type": "string", "enum": ["open", "closed"]}
+          "ticket_id": {
+            "type": "string",
+            "pattern": "^[A-Z]+-[0-9]+$"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "open",
+              "closed"
+            ]
+          }
         },
-        "required": ["ticket_id", "status"]
+        "required": [
+          "ticket_id",
+          "status"
+        ]
       }
     },
     {
       "name": "slack_post",
+      "executor": "slack",
       "kind": "freeform",
       "direction": "outbound",
       "resource_arg": "channel",
+      "secret_path": "demo/slack",
       "args_schema": {
         "type": "object",
         "properties": {
-          "channel": {"type": "string", "enum": ["#triage-internal", "#general"]},
-          "text": {"type": "string", "maxLength": 2000}
+          "channel": {
+            "type": "string",
+            "enum": [
+              "#triage-internal",
+              "#general"
+            ]
+          },
+          "text": {
+            "type": "string",
+            "maxLength": 2000
+          }
         },
-        "required": ["channel", "text"]
+        "required": [
+          "channel",
+          "text"
+        ]
       }
     }
   ]

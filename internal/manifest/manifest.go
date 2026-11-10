@@ -48,6 +48,16 @@ type Tool struct {
 	// Enforced by the governor (G-7), never by a token. 0 means no cap.
 	MaxCallsPerTask int `json:"max_calls_per_task,omitempty"`
 
+	// Executor names the executor family that runs this tool (week 3):
+	// "echo", "jira", "slack". Defaults to "echo". The governor spawns
+	// `executor -family <this>`; the family code decides what the tool does.
+	Executor string `json:"executor,omitempty"`
+
+	// SecretPath is the secrets-backend path of the credential this tool
+	// needs, released by the sidecar only to an executor holding a valid
+	// token for this tool. Empty means the tool needs no credential.
+	SecretPath string `json:"secret_path,omitempty"`
+
 	// ResourceArg names the args field whose value becomes the Cedar
 	// `resource` (Target::"<value>") so policy can say "this channel but not
 	// that one". The field's schema must be a string bounded by enum or
@@ -193,7 +203,11 @@ func parse(raw []byte) (*Manifest, error) {
 	}
 
 	seen := map[string]bool{}
-	for _, t := range m.Tools {
+	for i := range m.Tools {
+		t := &m.Tools[i]
+		if t.Executor == "" {
+			t.Executor = "echo"
+		}
 		if t.Name == "" {
 			return nil, fmt.Errorf("%w: tool with empty name", ErrInvalid)
 		}

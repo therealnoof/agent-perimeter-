@@ -1,10 +1,19 @@
 package main
 
 import (
+	"crypto/ed25519"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
+	"strings"
+
+	"github.com/therealnoof/agent-perimeter/internal/tokens"
 )
+
+func generateGovKey() (ed25519.PublicKey, ed25519.PrivateKey, error) { return tokens.GenerateKey() }
+func fingerprint(pub ed25519.PublicKey) string                       { return tokens.Fingerprint(pub) }
 
 func main() {
 	if len(os.Args) < 2 {
@@ -17,6 +26,8 @@ func main() {
 		err = cmdRun(os.Args[2:])
 	case "verify":
 		err = cmdVerify(os.Args[2:])
+	case "keygen":
+		err = cmdKeygen(os.Args[2:])
 	case "-h", "--help", "help":
 		usage()
 		return
@@ -33,8 +44,46 @@ func main() {
 
 func usage() {
 	fmt.Fprintln(os.Stderr, `usage:
-  agentd run -manifest M.json -pubkey K.pub -audit LOG.jsonl [-worker-uid N] [-dry-run] [-kill-dir DIR] -- CMD [ARGS...]
+  agentd keygen -out run/governor.key                      (once; also writes run/governor.pub)
+  agentd run -manifest M.json -pubkey K.pub -policies DIR -audit LOG.jsonl -gov-key run/governor.key
+             [-worker-user U] [-executor BIN] [-secrets-sock SOCK] [-approver cli|deny] [-dry-run] [-kill-dir DIR] -- CMD [ARGS...]
   agentd verify -audit LOG.jsonl`)
+}
+
+// cmdKeygen writes a new governor token-signing key, mode 0600. Run once per
+// governor installation; start secretsd with the matching public key, which
+// `agentd run` writes to -gov-pub-out.
+func cmdKeygen(args []string) error {
+	fs := flag.NewFlagSet("keygen", flag.ContinueOnError)
+	out := fs.String("out", "", "where to write the private key (hex, mode 0600)")
+	pubOut := fs.String("pub-out", "", "where to write the public key (hex); default: <out> with .pub extension")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *out == "" {
+		return fmt.Errorf("keygen: -out is required")
+	}
+	if *pubOut == "" {
+		*pubOut = strings.TrimSuffix(*out, filepath.Ext(*out)) + ".pub"
+	}
+	if _, err := os.Stat(*out); err == nil {
+		return fmt.Errorf("keygen: %s exists; refusing to overwrite", *out)
+	}
+	pub, priv, err := generateGovKey()
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(*out), 0o755); err != nil {
+		return err
+	}
+	if err := os.WriteFile(*out, []byte(hex.EncodeToString(priv)+"\n"), 0o600); err != nil {
+		return err
+	}
+	if err := os.WriteFile(*pubOut, []byte(hex.EncodeToString(pub)+"\n"), 0o644); err != nil {
+		return err
+	}
+	fmt.Printf("governor key written to %s, public key to %s (fingerprint %s)\n", *out, *pubOut, fingerprint(pub)[:12])
+	return nil
 }
 
 // cmdVerify walks the chain and prints the result. Exit status is the answer.

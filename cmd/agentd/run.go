@@ -1,7 +1,8 @@
 package main
 
 import (
-	"crypto/sha256"
+	"bytes"
+	"crypto/ed25519"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -18,12 +19,15 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/therealnoof/agent-perimeter/internal/approval"
 	"github.com/therealnoof/agent-perimeter/internal/audit"
+	"github.com/therealnoof/agent-perimeter/internal/canon"
 	"github.com/therealnoof/agent-perimeter/internal/manifest"
 	"github.com/therealnoof/agent-perimeter/internal/policy"
 	"github.com/therealnoof/agent-perimeter/internal/schema"
 	"github.com/therealnoof/agent-perimeter/internal/socket"
 	"github.com/therealnoof/agent-perimeter/internal/taskstate"
+	"github.com/therealnoof/agent-perimeter/internal/tokens"
 )
 
 // verifyChain is a thin alias so main.go does not import audit directly.
@@ -43,10 +47,18 @@ type governor struct {
 	man     *manifest.Manifest
 	schemas map[string]*schema.Schema // compiled per tool at startup
 	engine  *policy.Engine            // signed Cedar policies, loaded at startup
+	minter  *tokens.Minter            // per-call token signer (C-1)
+	approve approval.Approver         // human gate for "approve" verdicts (A-3)
 	tasks   *taskstate.Store
 	log     *audit.Writer
 	user    string // originating_user for every audit record
 	dryRun  bool
+
+	// How to run a tool: the executor binary and what it needs to know.
+	executorBin string
+	govPubPath  string
+	secretsSock string
+	mockAddr    string
 }
 
 func cmdRun(args []string) error {
@@ -59,6 +71,13 @@ func cmdRun(args []string) error {
 	workerUser := fs.String("worker-user", "", "run the worker AS this user (requires agentd to start as root); implies -worker-uid")
 	dryRun := fs.Bool("dry-run", false, "log verdicts but execute anyway (P-5)")
 	killDir := fs.String("kill-dir", "", "directory to watch; any file appearing there stops the worker (G-6)")
+	govKey := fs.String("gov-key", "", "governor token-signing private key (hex); generate with 'agentd keygen'")
+	govPubOut := fs.String("gov-pub-out", "run/governor.pub", "where to write the governor public key for executors and secretsd")
+	executorBin := fs.String("executor", "bin/executor", "executor binary spawned per allowed call")
+	secretsSock := fs.String("secrets-sock", "", "secretsd socket passed to executors (empty: tools with secrets will fail)")
+	mockAddr := fs.String("mock-addr", "127.0.0.1:9811", "mock service address passed to executors")
+	approver := fs.String("approver", "cli", "who answers approve verdicts: cli | deny | allow-all-UNSAFE-tests-only")
+	approvalTimeout := fs.Duration("approval-timeout", approval.DefaultTimeout, "how long a CLI prompt waits before deny")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -92,6 +111,38 @@ func cmdRun(args []string) error {
 	engine, err := policy.Load(*policyDir, pub)
 	if err != nil {
 		return fmt.Errorf("refusing to start: %w", err)
+	}
+
+	// --- C-1: the governor's own token-signing key. ---
+	// Generated once with `agentd keygen` and kept on disk mode 0600, so the
+	// sidecar can be started with the public half before the governor runs.
+	if *govKey == "" {
+		return fmt.Errorf("run: -gov-key is required (run 'agentd keygen -out run/governor.key' once)")
+	}
+	govPriv, err := loadGovKey(*govKey)
+	if err != nil {
+		return err
+	}
+	govPub := govPriv.Public().(ed25519.PublicKey)
+	if err := os.MkdirAll(filepath.Dir(*govPubOut), 0o755); err != nil {
+		return err
+	}
+	if err := os.WriteFile(*govPubOut, []byte(hex.EncodeToString(govPub)+"\n"), 0o644); err != nil {
+		return fmt.Errorf("run: write governor public key: %w", err)
+	}
+
+	// --- A-3: who answers "approve". ---
+	var appr approval.Approver
+	switch *approver {
+	case "cli":
+		appr = approval.NewCLI(*approvalTimeout)
+	case "deny":
+		appr = approval.DenyAll{}
+	case "allow-all-UNSAFE-tests-only":
+		fmt.Fprintln(os.Stderr, "agentd: WARNING: every approve verdict will be auto-approved; this mode is for tests only")
+		appr = approval.AllowAll{Who: "auto"}
+	default:
+		return fmt.Errorf("run: -approver must be cli, deny, or allow-all-UNSAFE-tests-only")
 	}
 
 	uid := uint32(os.Getuid())
@@ -136,10 +187,14 @@ func cmdRun(args []string) error {
 	}
 	defer log.Close()
 
-	g := &governor{man: man, schemas: schemas, engine: engine, tasks: taskstate.New(), log: log, user: me, dryRun: *dryRun}
+	g := &governor{
+		man: man, schemas: schemas, engine: engine, tasks: taskstate.New(), log: log, user: me, dryRun: *dryRun,
+		minter: tokens.NewMinter(govPriv, 0), approve: appr,
+		executorBin: *executorBin, govPubPath: *govPubOut, secretsSock: *secretsSock, mockAddr: *mockAddr,
+	}
 
-	g.record(audit.Record{Event: "start", Detail: fmt.Sprintf("manifest=%s policies=%s worker_uid=%d dry_run=%v",
-		filepath.Base(*manifestPath), strings.Join(engine.Files(), ","), uid, *dryRun)})
+	g.record(audit.Record{Event: "start", Detail: fmt.Sprintf("manifest=%s policies=%s worker_uid=%d dry_run=%v governor=%s approver=%s",
+		filepath.Base(*manifestPath), strings.Join(engine.Files(), ","), uid, *dryRun, tokens.Fingerprint(govPub)[:12], *approver)})
 
 	// --- G-2: spawn the worker with its end of the socketpair on fd 3. ---
 	cmd := exec.Command(workerCmd[0], workerCmd[1:]...)
@@ -233,8 +288,7 @@ func (g *governor) handle(raw []byte) response {
 	// Hash the args once. Policy sees the hash; the audit record carries the
 	// hash; week 3's Biscuit binds to the hash. The args themselves go only to
 	// the schema validator and, later, the executor.
-	sum := sha256.Sum256(canonical(req.Args))
-	argsHash := hex.EncodeToString(sum[:])
+	argsHash := canon.Hash(req.Args)
 
 	tool := g.man.Tool(req.Tool)
 	if tool != nil {
@@ -271,7 +325,7 @@ func (g *governor) handle(raw []byte) response {
 			// Safe to read: the manifest loader proved this field is an
 			// enum- or pattern-bounded string, and the schema validator just
 			// proved this value satisfies it.
-			in.Target = stringArg(req.Args, tool.ResourceArg)
+			in.Target = canon.StringField(req.Args, tool.ResourceArg)
 		}
 	}
 	d := g.engine.Decide(in)
@@ -282,6 +336,7 @@ func (g *governor) handle(raw []byte) response {
 		TaintHWM: &taint, ArgsHash: argsHash, DryRun: g.dryRun,
 	})
 
+	approverID := ""
 	switch d.Verdict {
 	case policy.Deny:
 		if !g.dryRun {
@@ -289,34 +344,113 @@ func (g *governor) handle(raw []byte) response {
 		}
 		// P-5: dry-run logs the deny and falls through to execute.
 	case policy.Approve:
-		// Week 3 adds the CLI approval gate. Until then, approve is reported
-		// to the worker as pending and nothing executes.
-		if !g.dryRun {
-			return response{Verdict: "approve", ReasonCode: d.ReasonCode, Rule: d.Rule}
+		if g.dryRun {
+			break
 		}
+		// A-3: a human sees structural facts and decides. The agent's
+		// justification is carried but hidden until asked for.
+		out := g.approve.Ask(approval.Prompt{
+			TaskID: req.TaskID, Tool: req.Tool, Target: in.Target, TaintHWM: taint,
+			Rule: d.Rule, ArgsHash: argsHash, Justification: req.Justification,
+		})
+		g.record(audit.Record{
+			Event: "approval", TaskID: req.TaskID, Tool: req.Tool, ArgsHash: argsHash,
+			ApproverID: out.ApproverID, ReasonCode: out.ReasonCode, RuleFired: d.Rule,
+			Verdict: map[bool]string{true: "approved", false: "declined"}[out.Approved],
+		})
+		if !out.Approved {
+			return response{Verdict: "deny", ReasonCode: out.ReasonCode, Rule: d.Rule}
+		}
+		approverID = out.ApproverID
 	}
 
-	// Allowed (or dry-run). Count it, run it, then raise taint by what the
-	// tool's SOURCE is declared to return (D-2). The content is never
-	// inspected; a confidential ticket read is confidential whether or not
-	// the agent later reformats it.
+	// Allowed (or approved, or dry-run). Count it, run it, then raise taint
+	// by what the tool's SOURCE is declared to return (D-2). The content is
+	// never inspected; a confidential ticket read is confidential whether or
+	// not the agent later reformats it.
 	g.tasks.RecordAllow(req.TaskID, req.Tool)
-	result, exit := g.execute(req)
+	result, jti, exit, detail := g.execute(req, tool, in.Target, argsHash)
 	newTaint := taint
 	if tool != nil && tool.ResultSensitivity > 0 && exit == 0 {
 		newTaint = g.tasks.RaiseTaint(req.TaskID, tool.ResultSensitivity)
 	}
-	g.record(audit.Record{Event: "executor", TaskID: req.TaskID, Tool: req.Tool, ArgsHash: argsHash, ExitCode: &exit, TaintHWM: &newTaint, Detail: "stub"})
+	g.record(audit.Record{
+		Event: "executor", TaskID: req.TaskID, Tool: req.Tool, ArgsHash: argsHash,
+		TokenID: jti, ExitCode: &exit, TaintHWM: &newTaint, ApproverID: approverID, Detail: detail,
+	})
+	if exit != 0 {
+		return response{Verdict: "deny", ReasonCode: "executor_failed", Rule: d.Rule}
+	}
 	return response{Verdict: "allow", Result: result}
 }
 
-// execute is the week-1 stand-in for real executors (week 3). It echoes the
-// args back so the end-to-end path can be demonstrated. It is the only place
-// in the governor that will ever hand args onward, and in week 3 it becomes
-// "spawn executor with Biscuit + credential on stdin".
-func (g *governor) execute(req *schema.Request) (json.RawMessage, int) {
-	out := map[string]any{"stub": true, "tool": req.Tool, "echo": req.Args}
-	return mustJSON(out), 0
+// execute mints a per-call token and runs the tool in a fresh executor
+// process (E-1). The token binds tool, target and args hash and lives five
+// seconds; the executor verifies it offline before doing anything (C-2).
+// The governor never sees a credential: the executor fetches its own from
+// the sidecar, presenting the same token.
+//
+// Returns the executor's stdout (the result), the token id, the exit code,
+// and a one-line detail for the audit record. Exit codes: 0 ok, 2 token
+// rejected, 3 credential refused, 4 tool failed, 1 internal.
+func (g *governor) execute(req *schema.Request, tool *manifest.Tool, target, argsHash string) (json.RawMessage, string, int, string) {
+	if tool == nil {
+		// Only reachable in dry-run for an unknown tool.
+		return nil, "", 1, "no such tool"
+	}
+	tok, jti, err := g.minter.Mint(req.Tool, target, argsHash, req.TaskID)
+	if err != nil {
+		return nil, "", 1, "mint: " + err.Error()
+	}
+
+	job, _ := json.Marshal(map[string]any{
+		"token": tok, "tool": req.Tool, "target": target, "args": req.Args,
+	})
+	args := []string{"-family", tool.Executor, "-gov-pub", g.govPubPath, "-mock-addr", g.mockAddr}
+	if g.secretsSock != "" {
+		args = append(args, "-secrets-sock", g.secretsSock)
+	}
+	cmd := exec.Command(g.executorBin, args...)
+	cmd.Stdin = bytes.NewReader(job)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	cmd.Env = []string{"PATH=/usr/local/bin:/usr/bin:/bin"} // nothing of ours
+
+	err = cmd.Run()
+	code := 0
+	if ee, ok := err.(*exec.ExitError); ok {
+		code = ee.ExitCode()
+	} else if err != nil {
+		return nil, jti, 1, "spawn: " + err.Error()
+	}
+	detail := strings.TrimSpace(stderr.String())
+	if detail == "" {
+		detail = tool.Executor
+	}
+	if code != 0 {
+		return nil, jti, code, detail
+	}
+	return json.RawMessage(bytes.TrimSpace(stdout.Bytes())), jti, 0, detail
+}
+
+// loadGovKey reads the governor's hex Ed25519 private key.
+func loadGovKey(path string) (ed25519.PrivateKey, error) {
+	st, err := os.Stat(path)
+	if err != nil {
+		return nil, fmt.Errorf("run: governor key: %w", err)
+	}
+	if st.Mode().Perm()&0o077 != 0 {
+		return nil, fmt.Errorf("run: governor key %s is readable by others (mode %o); chmod 600 it", path, st.Mode().Perm())
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	key, err := hex.DecodeString(strings.TrimSpace(string(b)))
+	if err != nil || len(key) != ed25519.PrivateKeySize {
+		return nil, fmt.Errorf("run: governor key is not a valid Ed25519 private key")
+	}
+	return ed25519.PrivateKey(key), nil
 }
 
 // record appends to the audit chain, filling the identity fields. Failures to
@@ -368,34 +502,6 @@ func minimalEnv() []string {
 		"PERIMETER_FD=" + strconv.Itoa(socket.WorkerFD),
 		"PYTHONUNBUFFERED=1",
 	}
-}
-
-// stringArg returns args[field] if it is a string, else "". Only called for a
-// field the manifest declared as resource_arg and the schema already validated.
-func stringArg(raw json.RawMessage, field string) string {
-	var m map[string]json.RawMessage
-	if json.Unmarshal(raw, &m) != nil {
-		return ""
-	}
-	var v string
-	if json.Unmarshal(m[field], &v) != nil {
-		return ""
-	}
-	return v
-}
-
-// canonical re-encodes JSON with sorted keys and no whitespace so that the
-// same logical args always hash the same. encoding/json sorts map keys.
-func canonical(raw json.RawMessage) []byte {
-	var v any
-	if err := json.Unmarshal(raw, &v); err != nil {
-		return raw
-	}
-	b, err := json.Marshal(v)
-	if err != nil {
-		return raw
-	}
-	return b
 }
 
 func mustJSON(v any) json.RawMessage {
