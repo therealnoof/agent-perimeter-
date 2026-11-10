@@ -49,7 +49,9 @@ type CLI struct {
 	Timeout time.Duration
 	Who     string // approver id; defaults to the current user
 
-	mu sync.Mutex // one prompt at a time
+	mu    sync.Mutex  // one prompt at a time
+	once  sync.Once   // start the reader exactly once per CLI
+	lines chan string // every line typed, for the life of the process
 }
 
 // NewCLI returns a terminal approver on stdin/stderr.
@@ -65,18 +67,38 @@ func (c *CLI) Ask(p Prompt) Outcome {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	// One reader goroutine for the life of this CLI. A reader per Ask would
+	// leave the previous one blocked on Scan, stealing the next prompt's
+	// keystrokes (found in the first interactive demo).
+	c.once.Do(func() {
+		c.lines = make(chan string, 16)
+		go func() {
+			sc := bufio.NewScanner(c.In)
+			for sc.Scan() {
+				c.lines <- strings.ToLower(strings.TrimSpace(sc.Text()))
+			}
+			close(c.lines)
+		}()
+	})
+
+	// Anything typed while no prompt was open is not an answer to this
+	// one. Drain it so a stray "a" from earlier cannot approve this call.
+	for {
+		select {
+		case _, ok := <-c.lines:
+			if !ok {
+				fmt.Fprintln(c.Out, "\n[approval] input closed: DENIED (approval_unavailable)")
+				return Outcome{false, c.Who, "approval_unavailable"}
+			}
+			continue
+		default:
+		}
+		break
+	}
+
 	deadline := time.Now().Add(c.Timeout)
 	c.render(p, false, deadline)
-
-	// Read lines on a goroutine so we can race against the deadline.
-	lines := make(chan string)
-	go func() {
-		sc := bufio.NewScanner(c.In)
-		for sc.Scan() {
-			lines <- strings.ToLower(strings.TrimSpace(sc.Text()))
-		}
-		close(lines)
-	}()
+	lines := c.lines
 
 	timer := time.NewTimer(c.Timeout)
 	defer timer.Stop()

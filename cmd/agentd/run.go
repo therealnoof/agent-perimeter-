@@ -371,8 +371,18 @@ func (g *governor) handle(raw []byte) response {
 	g.tasks.RecordAllow(req.TaskID, req.Tool)
 	result, jti, exit, detail := g.execute(req, tool, in.Target, argsHash)
 	newTaint := taint
-	if tool != nil && tool.ResultSensitivity > 0 && exit == 0 {
-		newTaint = g.tasks.RaiseTaint(req.TaskID, tool.ResultSensitivity)
+	if tool != nil && exit == 0 {
+		// D-2: taint rises to the higher of the manifest's floor for this
+		// source and what the executor learned from the source system's own
+		// classification. The executor is on the trusted side (it verified
+		// our token and we spawned it); the worker never gets a say.
+		level := tool.ResultSensitivity
+		if reported := reportedSensitivity(result); reported > level {
+			level = reported
+		}
+		if level > 0 {
+			newTaint = g.tasks.RaiseTaint(req.TaskID, level)
+		}
 	}
 	g.record(audit.Record{
 		Event: "executor", TaskID: req.TaskID, Tool: req.Tool, ArgsHash: argsHash,
@@ -431,6 +441,23 @@ func (g *governor) execute(req *schema.Request, tool *manifest.Tool, target, arg
 		return nil, jti, code, detail
 	}
 	return json.RawMessage(bytes.TrimSpace(stdout.Bytes())), jti, 0, detail
+}
+
+// reportedSensitivity reads the executor's "sensitivity" field, clamped 0-10.
+func reportedSensitivity(result json.RawMessage) int {
+	var env struct {
+		Sensitivity int `json:"sensitivity"`
+	}
+	if json.Unmarshal(result, &env) != nil {
+		return 0
+	}
+	if env.Sensitivity < 0 {
+		return 0
+	}
+	if env.Sensitivity > 10 {
+		return 10
+	}
+	return env.Sensitivity
 }
 
 // loadGovKey reads the governor's hex Ed25519 private key.

@@ -1,6 +1,7 @@
 package approval
 
 import (
+	"bufio"
 	"bytes"
 	"io"
 	"strings"
@@ -99,5 +100,58 @@ func TestDenyAllAndAllowAll(t *testing.T) {
 	}
 	if o := (AllowAll{Who: "ci"}).Ask(prompt()); !o.Approved || o.ApproverID != "ci" {
 		t.Fatal("AllowAll did not approve")
+	}
+}
+
+// Regression: a second prompt on the same CLI must see its own keystrokes.
+// With a reader per Ask, the first Ask's reader stole the second's input.
+// Input arrives through a pipe AFTER each prompt opens, as a terminal would.
+func TestSequentialPromptsOnOneCLI(t *testing.T) {
+	pr, pw := io.Pipe()
+	out := &bytes.Buffer{}
+	c := &CLI{In: pr, Out: out, Timeout: 2 * time.Second, Who: "tester"}
+	typeAfter := func(delay time.Duration, text string) {
+		go func() { time.Sleep(delay); pw.Write([]byte(text)) }()
+	}
+
+	typeAfter(50*time.Millisecond, "a\n")
+	if o := c.Ask(prompt()); !o.Approved {
+		t.Fatalf("first: got %+v", o)
+	}
+	typeAfter(50*time.Millisecond, "j\n")
+	typeAfter(150*time.Millisecond, "d\n")
+	if o := c.Ask(prompt()); o.Approved || o.ReasonCode != "declined" {
+		t.Fatalf("second: got %+v", o)
+	}
+	if strings.Count(out.String(), "AGENT'S OWN WORDS") != 1 {
+		t.Fatal("'j' on the second prompt did not render the justification")
+	}
+}
+
+// A line typed before a prompt opens must not answer it.
+func TestStaleInputIsDrained(t *testing.T) {
+	pr, pw := io.Pipe()
+	out := &bytes.Buffer{}
+	c := &CLI{In: pr, Out: out, Timeout: 300 * time.Millisecond, Who: "tester"}
+	// Prime the reader and let a stray "a" sit in the channel.
+	c.once.Do(func() {
+		c.lines = make(chan string, 16)
+		go func() {
+			sc := bufio.NewScanner(c.In)
+			for sc.Scan() {
+				c.lines <- strings.ToLower(strings.TrimSpace(sc.Text()))
+			}
+			close(c.lines)
+		}()
+	})
+	pw.Write([]byte("a\n"))
+	time.Sleep(50 * time.Millisecond)
+	// Now ask. The stray "a" must be drained; with nothing else typed, timeout.
+	o := c.Ask(prompt())
+	if o.Approved {
+		t.Fatal("stray input approved the prompt")
+	}
+	if o.ReasonCode != "approval_timeout" {
+		t.Fatalf("got %+v", o)
 	}
 }

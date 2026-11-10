@@ -38,7 +38,19 @@ func runJira(j job, secret map[string]any, addr string) (any, error) {
 	}
 	switch j.Tool {
 	case "jira_read":
-		return call("GET", fmt.Sprintf("http://%s/jira/issue/%s", addr, args.TicketID), tok, nil)
+		res, err := call("GET", fmt.Sprintf("http://%s/jira/issue/%s", addr, args.TicketID), tok, nil)
+		if err != nil {
+			return nil, err
+		}
+		// The source system's own classification decides how sensitive this
+		// result is. We report it; the governor raises the task's taint to
+		// at least this (and never below the manifest's floor).
+		if m, ok := res.(map[string]any); ok && m["security"] == "confidential" {
+			reportSensitivity(8)
+		} else {
+			reportSensitivity(1)
+		}
+		return res, nil
 	case "jira_update":
 		body := map[string]string{"status": args.Status}
 		return call("PUT", fmt.Sprintf("http://%s/jira/issue/%s", addr, args.TicketID), tok, body)
@@ -64,6 +76,17 @@ func runSlack(j job, secret map[string]any, addr string) (any, error) {
 		return nil, fmt.Errorf("slack family does not implement %s", j.Tool)
 	}
 	return call("POST", fmt.Sprintf("http://%s/slack/chat.postMessage", addr), tok, map[string]string{"channel": args.Channel, "text": args.Text})
+}
+
+// sensitivity is what the family learned about the result's classification
+// from the source system, 0 if it has no opinion. Written into the output
+// envelope by main.
+var sensitivity int
+
+func reportSensitivity(n int) {
+	if n > sensitivity {
+		sensitivity = n
+	}
 }
 
 // --- shared HTTP helper -------------------------------------------------------------

@@ -4,7 +4,11 @@
 //	executor -family jira -gov-pub run/governor.pub [-secrets-sock PATH] [-mock-addr HOST:PORT]
 //
 // stdin:  one JSON object {"token", "tool", "target", "args"}
-// stdout: the tool's result as JSON
+// stdout: {"ok", "tool", "jti", "result", "sensitivity"?} — sensitivity is
+//
+//	the source system's own classification of the result (0-10) when
+//	the family can tell; the governor raises task taint to it
+//
 // stderr: diagnostics
 // exit:   0 ok · 2 token rejected · 3 credential refused · 4 tool failed · 1 other
 //
@@ -123,6 +127,9 @@ func run(family, govPub, secretsSock, mockAddr string) int {
 	}
 
 	out := map[string]any{"ok": true, "tool": j.Tool, "jti": claims.JTI, "result": result}
+	if sensitivity > 0 {
+		out["sensitivity"] = sensitivity
+	}
 	json.NewEncoder(os.Stdout).Encode(out)
 	return exitOK
 }

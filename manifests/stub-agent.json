@@ -29,7 +29,7 @@
       "direction": "inbound",
       "resource_arg": "ticket_id",
       "secret_path": "demo/jira",
-      "result_sensitivity": 8,
+      "result_sensitivity": 1,
       "args_schema": {
         "type": "object",
         "properties": {
@@ -101,4 +101,4 @@
       }
     }
   ]
-}
+}\n
