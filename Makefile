@@ -68,7 +68,7 @@ check-signed: build
 	@for p in $(POLICIES); do $(BIN)/sign-manifest verify -pub $(PUBKEY) -in $$p -sig $$p.sig >/dev/null 2>&1 \
 		|| { echo "$$p is not signed by $(PUBKEY). Run: make sign"; exit 1; }; done
 
-demo-week1: check-signed $(GOVKEY) ## Week-1 sequence: verdict classes, call cap, schema rejection, justification retry
+demo-week1: check-signed gov-key ## Week-1 sequence: verdict classes, call cap, schema rejection, justification retry
 	@mkdir -p run
 	$(BIN)/agentd run -manifest manifests/stub-agent.json -pubkey $(PUBKEY) -audit run/audit.jsonl \
 		-gov-key $(GOVKEY) -gov-pub-out $(GOVPUB) -executor $(BIN)/executor -approver deny -- python3 agents/stub_worker.py
@@ -95,13 +95,11 @@ GOVPUB    := $(RUN)/governor.pub
 SECSOCK   := $(RUN)/secrets.sock
 MOCKADDR  := 127.0.0.1:9811
 
-$(GOVKEY): build
+gov-key: build ## Generate the governor token-signing key if it does not exist (run/governor.key, mode 0600)
 	@mkdir -p $(RUN)
-	$(BIN)/agentd keygen -out $(GOVKEY) -pub-out $(GOVPUB)
+	@[ -f $(GOVKEY) ] || $(BIN)/agentd keygen -out $(GOVKEY) -pub-out $(GOVPUB)
 
-gov-key: $(GOVKEY) ## Generate the governor token-signing key once (run/governor.key, mode 0600)
-
-services-up: build $(GOVKEY) ## Start mockserv and secretsd in the background (logs and pidfiles in run/)
+services-up: build gov-key ## Start mockserv and secretsd in the background (logs and pidfiles in run/)
 	@mkdir -p $(RUN)
 	@chmod 600 deploy/secrets.demo.json
 	@$(MAKE) -s services-down
