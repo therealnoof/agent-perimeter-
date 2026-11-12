@@ -121,3 +121,5 @@ Every Go package has a `doc.go` that says what it owns and what it must never do
 ## Requirements
 
 Linux (uses `socketpair`, `SCM_CREDENTIALS`, process groups), Go 1.23+, Python 3.10+ for the client and worker. No network needed after `git clone`.
+
+- `docs/traffic-flow.html` — interactive step-through of the traffic flow, boundaries and attestation points (open in a browser; also published as a Claude artifact).

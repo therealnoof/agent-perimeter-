@@ -1,0 +1,497 @@
+<title>Agent Perimeter Traffic Flow</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+/* Layout: one wide diagram with a step rail beside it (stacks on phones); reference sections below. */
+:root {
+  --bg: #f6f7f9;        /* cool paper */
+  --panel: #ffffff;
+  --fg: #1a1f2b;
+  --muted: #5b6474;
+  --line: #d6dbe3;
+  --zone-worker: #fff4e0;   /* untrusted: warm */
+  --zone-host: #e8eef8;     /* trusted: cool */
+  --zone-exec: #eef3e6;     /* confined: green-grey */
+  --accent: #1f5fbf;        /* governor blue */
+  --attest: #b8860b;        /* attestation gold */
+  --ok: #1d7a4a;
+  --deny: #b3261e;
+  --wait: #a35c00;
+  --font-body: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #0f1218; --panel: #171b23; --fg: #e6e9ef; --muted: #9aa3b2; --line: #2b3240;
+  --zone-worker: #2a2214; --zone-host: #16202f; --zone-exec: #182116;
+  --accent: #6ea0f0; --attest: #e0b341; --ok: #4fc083; --deny: #f07167; --wait: #f0a948; color-scheme: dark }
+}
+:root[data-theme="dark"] {
+  --bg: #0f1218; --panel: #171b23; --fg: #e6e9ef; --muted: #9aa3b2; --line: #2b3240;
+  --zone-worker: #2a2214; --zone-host: #16202f; --zone-exec: #182116;
+  --accent: #6ea0f0; --attest: #e0b341; --ok: #4fc083; --deny: #f07167; --wait: #f0a948; color-scheme: dark }
+
+* { box-sizing: border-box }
+body { background: var(--bg); color: var(--fg); font-family: var(--font-body); line-height: 1.5;
+  padding-block: 28px 56px; padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); }
+.wrap { max-width: 1180px; margin: 0 auto; display: grid; gap: 28px }
+h1, h2, h3 { font-weight: 600; letter-spacing: -0.01em; text-wrap: balance; margin: 0 }
+h1 { font-size: clamp(1.5rem, 2.5vw, 2rem) }
+h2 { font-size: 1.2rem; margin-bottom: 10px }
+h3 { font-size: 1rem }
+p { margin: 0 0 10px; max-width: 68ch }
+.lede { color: var(--muted); max-width: 72ch }
+code, .mono { font-family: var(--font-mono); font-size: 0.86em }
+code { background: color-mix(in srgb, var(--fg) 7%, transparent); padding: 1px 5px; border-radius: 4px }
+.eyebrow { font-size: 0.72rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); font-weight: 500 }
+
+/* scenario picker */
+.scenarios { display: flex; flex-wrap: wrap; gap: 8px }
+.scenarios button { font: inherit; font-size: 0.9rem; font-weight: 500; padding: 8px 14px; border-radius: 999px; border: 1px solid var(--line);
+  background: var(--panel); color: var(--fg); cursor: pointer }
+.scenarios button[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: #fff }
+.scenarios button:focus-visible, .ctl button:focus-visible, .node:focus-visible { outline: 2px solid var(--attest); outline-offset: 2px }
+
+/* diagram + rail */
+.stage { display: grid; grid-template-columns: minmax(0, 1fr) 340px; gap: 20px; align-items: start }
+@media (max-width: 900px) { .stage { grid-template-columns: 1fr } }
+.diagram { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px; min-width: 0; overflow-x: auto }
+svg { display: block; width: 100%; height: auto; max-width: 100%; font-family: var(--font-body) }
+.zone { stroke-width: 1; stroke-dasharray: 5 4; rx: 10 }
+.zone-label { font-size: 12px; font-weight: 600; fill: var(--fg) }
+.zone-sub { font-size: 10.5px; fill: var(--muted) }
+.node rect { fill: var(--panel); stroke: var(--line); stroke-width: 1.5; rx: 7; transition: stroke .2s, stroke-width .2s }
+.node text { font-size: 12.5px; fill: var(--fg); pointer-events: none }
+.node .sub { font-size: 10.5px; fill: var(--muted) }
+.node { cursor: pointer }
+.node.active rect { stroke: var(--accent); stroke-width: 3 }
+.node.deny rect { stroke: var(--deny); stroke-width: 3 }
+.node.ok rect { stroke: var(--ok); stroke-width: 3 }
+.edge { fill: none; stroke: var(--line); stroke-width: 2; transition: stroke .2s }
+.edge.lit { stroke: var(--accent); stroke-width: 3 }
+.edge.lit.deny { stroke: var(--deny) }
+.edge.lit.ok { stroke: var(--ok) }
+.edge.dashed { stroke-dasharray: 6 5 }
+.edge-label { font-size: 10.5px; fill: var(--muted) }
+.attest { opacity: .35; transition: opacity .2s, transform .2s; transform-box: fill-box; transform-origin: center }
+.attest.lit { opacity: 1; transform: scale(1.25) }
+.attest circle { fill: var(--attest) }
+.attest text { font-size: 11px; font-weight: 700; fill: #1a1300 }
+#packet { fill: var(--accent); stroke: var(--panel); stroke-width: 2; filter: drop-shadow(0 1px 2px rgba(0,0,0,.35)) }
+#packet.deny { fill: var(--deny) } #packet.ok { fill: var(--ok) } #packet.wait { fill: var(--wait) }
+@media (prefers-reduced-motion: reduce) { .attest, .node rect, .edge { transition: none } }
+
+.rail { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 16px; display: grid; gap: 12px; min-width: 0 }
+.ctl { display: flex; gap: 8px; align-items: center; flex-wrap: wrap }
+.ctl button { font: inherit; font-size: 0.85rem; padding: 6px 12px; border-radius: 6px; border: 1px solid var(--line); background: transparent; color: var(--fg); cursor: pointer }
+.ctl button:disabled { opacity: .4; cursor: default }
+.ctl .count { margin-left: auto; color: var(--muted); font-size: 0.85rem; font-variant-numeric: tabular-nums }
+.steps { list-style: none; margin: 0; padding: 0; display: grid; gap: 4px }
+.steps li { padding: 7px 10px; border-radius: 6px; font-size: 0.88rem; color: var(--muted); cursor: pointer; display: grid; grid-template-columns: 22px 1fr; gap: 8px; align-items: baseline }
+.steps li .n { font-family: var(--font-mono); font-size: 0.78rem }
+.steps li.cur { background: color-mix(in srgb, var(--accent) 12%, transparent); color: var(--fg); font-weight: 500 }
+.steps li.done { color: var(--fg) }
+.detail { border-top: 1px solid var(--line); padding-top: 12px; display: grid; gap: 8px }
+.detail h3 { display: flex; gap: 8px; align-items: center; flex-wrap: wrap }
+.pill { font-size: 0.7rem; font-weight: 600; letter-spacing: .05em; text-transform: uppercase; padding: 2px 8px; border-radius: 999px; color: #fff; background: var(--accent) }
+.pill.ok { background: var(--ok) } .pill.deny { background: var(--deny) } .pill.wait { background: var(--wait) } .pill.attest { background: var(--attest); color: #1a1300 }
+.detail p { font-size: 0.9rem; margin: 0 }
+.detail .check { font-size: 0.84rem; background: color-mix(in srgb, var(--attest) 14%, transparent); border-left: 3px solid var(--attest); padding: 8px 10px; border-radius: 0 6px 6px 0 }
+.detail .check b { color: var(--fg) }
+.legend { display: flex; flex-wrap: wrap; gap: 14px; font-size: 0.8rem; color: var(--muted); padding: 0 4px }
+.legend span { display: inline-flex; align-items: center; gap: 6px }
+.sw { width: 14px; height: 14px; border-radius: 3px; display: inline-block; border: 1px solid var(--line) }
+
+/* reference sections */
+.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 14px }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 16px; display: grid; gap: 8px; align-content: start; min-width: 0 }
+.card h3 { display: flex; align-items: center; gap: 8px }
+.card .tag { font-size: 0.68rem; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; padding: 2px 7px; border-radius: 4px }
+.card ul { margin: 0; padding-left: 18px; font-size: 0.88rem; display: grid; gap: 4px }
+.card p { font-size: 0.88rem; margin: 0 }
+.tablewrap { overflow-x: auto; background: var(--panel); border: 1px solid var(--line); border-radius: 10px }
+table { border-collapse: collapse; width: 100%; min-width: 760px; font-size: 0.86rem }
+th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--line); vertical-align: top }
+th { font-size: 0.72rem; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); font-weight: 600 }
+tr:last-child td { border-bottom: 0 }
+td:first-child { font-weight: 500; white-space: nowrap }
+.fail { color: var(--deny); font-family: var(--font-mono); font-size: 0.8rem }
+details { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px 16px }
+summary { cursor: pointer; font-weight: 500 }
+details p, details li { font-size: 0.9rem }
+</style>
+
+<div class="wrap">
+  <header>
+    <div class="eyebrow">agent-perimeter · week 4</div>
+    <h1>How a tool call crosses the perimeter</h1>
+    <p class="lede">An agent never touches a service, a credential or the network. It proposes a call over one file descriptor; a governor decides; a throwaway executor acts. Pick a scenario and step the packet through. Gold badges mark attestation points: places where something is cryptographically verified before traffic may continue.</p>
+  </header>
+
+  <div class="scenarios" id="scenarios" role="group" aria-label="Scenario"></div>
+
+  <div class="stage">
+    <div class="diagram">
+      <svg viewBox="0 0 1100 560" aria-label="Traffic flow diagram">
+        <!-- zones -->
+        <rect class="zone" x="18" y="60" width="200" height="440" fill="var(--zone-worker)" stroke="var(--wait)"/>
+        <text class="zone-label" x="30" y="84">Worker sandbox</text>
+        <text class="zone-sub" x="30" y="100">bwrap · no network interface</text>
+        <text class="zone-sub" x="30" y="114">ro /usr · script dir · /tmp · seccomp</text>
+        <text class="zone-sub" x="30" y="128">UNTRUSTED</text>
+
+        <rect class="zone" x="250" y="60" width="450" height="440" fill="var(--zone-host)" stroke="var(--accent)"/>
+        <text class="zone-label" x="262" y="84">Host · operator processes</text>
+        <text class="zone-sub" x="262" y="100">trusted side · four separate processes</text>
+
+        <rect class="zone" x="732" y="170" width="170" height="190" fill="var(--zone-exec)" stroke="var(--ok)"/>
+        <text class="zone-label" x="744" y="194">Executor sandbox</text>
+        <text class="zone-sub" x="744" y="210">bwrap · no network interface</text>
+        <text class="zone-sub" x="744" y="224">own binary · two sockets</text>
+
+        <!-- edges (ids used by steps) -->
+        <path id="e-wg" class="edge" d="M 200 280 L 280 280"/>
+        <text class="edge-label" x="206" y="268">fd 3 · SCM_CREDENTIALS</text>
+        <path id="e-gw" class="edge" d="M 280 300 L 200 300"/>
+        <path id="e-gx" class="edge" d="M 440 280 C 560 280, 620 290, 745 290"/>
+        <text class="edge-label" x="470" y="268">spawn · token on stdin</text>
+        <path id="e-xg" class="edge" d="M 745 310 C 620 310, 560 300, 440 300"/>
+        <text class="edge-label" x="482" y="326">stdout · result, exit code</text>
+        <path id="e-xs" class="edge" d="M 760 260 C 720 200, 700 170, 660 160"/>
+        <text class="edge-label" x="676" y="146">token → one secret</text>
+        <path id="e-xp" class="edge" d="M 760 330 C 720 400, 700 420, 660 420"/>
+        <text class="edge-label" x="640" y="452">CONNECT + token</text>
+        <path id="e-pj" class="edge" d="M 660 440 C 760 470, 880 470, 960 430"/>
+        <text class="edge-label" x="760" y="490">splice TCP</text>
+        <path id="e-ga" class="edge" d="M 360 320 L 360 400"/>
+        <text class="edge-label" x="368" y="366">append · hash chain</text>
+        <path id="e-wj" class="edge dashed" d="M 120 330 L 120 530 L 1010 530 L 1010 450"/>
+        <text class="edge-label" x="420" y="548">direct curl from the worker: no route</text>
+
+        <!-- nodes -->
+        <g class="node" id="n-w" data-info="worker" tabindex="0">
+          <rect x="40" y="250" width="160" height="70"/>
+          <text x="120" y="280" text-anchor="middle">stub_worker.py</text>
+          <text class="sub" x="120" y="298" text-anchor="middle">the agent · uid 1001</text>
+        </g>
+        <g class="node" id="n-g" data-info="governor" tabindex="0">
+          <rect x="280" y="245" width="160" height="80"/>
+          <text x="360" y="272" text-anchor="middle">agentd</text>
+          <text class="sub" x="360" y="290" text-anchor="middle">governor · Cedar policy</text>
+          <text class="sub" x="360" y="306" text-anchor="middle">scan · redact · mint</text>
+        </g>
+        <g class="node" id="n-a" data-info="audit" tabindex="0">
+          <rect x="280" y="400" width="160" height="56"/>
+          <text x="360" y="424" text-anchor="middle">audit chain</text>
+          <text class="sub" x="360" y="442" text-anchor="middle">hash-chained JSONL</text>
+        </g>
+        <g class="node" id="n-s" data-info="secretsd" tabindex="0">
+          <rect x="520" y="130" width="140" height="60"/>
+          <text x="590" y="155" text-anchor="middle">secretsd</text>
+          <text class="sub" x="590" y="173" text-anchor="middle">unix socket · Vault/file</text>
+        </g>
+        <g class="node" id="n-p" data-info="proxy" tabindex="0">
+          <rect x="520" y="390" width="140" height="60"/>
+          <text x="590" y="415" text-anchor="middle">egress-proxy</text>
+          <text class="sub" x="590" y="433" text-anchor="middle">unix socket · CONNECT</text>
+        </g>
+        <g class="node" id="n-x" data-info="executor" tabindex="0">
+          <rect x="745" y="260" width="140" height="70"/>
+          <text x="815" y="288" text-anchor="middle">executor</text>
+          <text class="sub" x="815" y="306" text-anchor="middle">one process per call</text>
+        </g>
+        <g class="node" id="n-j" data-info="service" tabindex="0">
+          <rect x="930" y="390" width="150" height="60"/>
+          <text x="1005" y="415" text-anchor="middle">Jira / Slack</text>
+          <text class="sub" x="1005" y="433" text-anchor="middle">127.0.0.1:9811 (mock)</text>
+        </g>
+
+        <!-- attestation badges -->
+        <g class="attest" id="a-uid" transform="translate(268,290)"><circle r="9"/><text text-anchor="middle" y="4">1</text></g>
+        <g class="attest" id="a-sig" transform="translate(292,255)"><circle r="9"/><text text-anchor="middle" y="4">2</text></g>
+        <g class="attest" id="a-tok" transform="translate(757,270)"><circle r="9"/><text text-anchor="middle" y="4">3</text></g>
+        <g class="attest" id="a-sec" transform="translate(532,140)"><circle r="9"/><text text-anchor="middle" y="4">4</text></g>
+        <g class="attest" id="a-prx" transform="translate(532,400)"><circle r="9"/><text text-anchor="middle" y="4">5</text></g>
+        <g class="attest" id="a-aud" transform="translate(292,410)"><circle r="9"/><text text-anchor="middle" y="4">6</text></g>
+
+        <circle id="packet" r="7" cx="120" cy="280" opacity="0"/>
+      </svg>
+      <div class="legend">
+        <span><i class="sw" style="background:var(--zone-worker)"></i>untrusted</span>
+        <span><i class="sw" style="background:var(--zone-host)"></i>trusted</span>
+        <span><i class="sw" style="background:var(--zone-exec)"></i>confined, per call</span>
+        <span><i class="sw" style="background:var(--attest);border-radius:50%"></i>attestation point (numbered in the table below)</span>
+      </div>
+    </div>
+
+    <aside class="rail">
+      <div class="ctl">
+        <button id="prev" type="button">← Back</button>
+        <button id="next" type="button">Next →</button>
+        <button id="play" type="button">▶ Play</button>
+        <span class="count" id="count"></span>
+      </div>
+      <ol class="steps" id="steps"></ol>
+      <div class="detail" id="detail"></div>
+    </aside>
+  </div>
+
+  <section>
+    <h2>The boundaries</h2>
+    <p class="lede">Four of them, each enforced by something different, so that one failure does not collapse the rest.</p>
+    <div class="cards">
+      <div class="card">
+        <h3>Worker ↔ governor <span class="tag" style="background:var(--zone-worker)">kernel</span></h3>
+        <p>The only channel is a <code>socketpair(2)</code> the governor created before the worker existed, inherited as fd 3. There is no port, no URL, nothing to discover.</p>
+        <ul>
+          <li>Every message carries kernel-stamped <code>SCM_CREDENTIALS</code>; a sender whose UID is not the worker's is dropped and the worker killed.</li>
+          <li>The worker runs as its own user and, with <code>-sandbox bwrap</code>, inside a namespace with no network interface.</li>
+          <li>Its environment is three variables. No proxy settings, no Vault address, no keys.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>Governor <span class="tag" style="background:var(--zone-host)">signatures</span></h3>
+        <p>The trust anchor. Standard library plus one vendored policy engine (Cedar), so the whole thing can be read.</p>
+        <ul>
+          <li>Refuses to start unless the manifest and every <code>.cedar</code> file verify against the operator's Ed25519 key. The private key never leaves the operator's machine.</li>
+          <li>Decides from structural facts only: role, tool, target, call count, taint, delegation depth, egress scan level. Never from the agent's prose.</li>
+          <li>Holds no service credential and no backend token. A compromised governor can authorise wrongly; it cannot harvest secrets.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>Executor <span class="tag" style="background:var(--zone-exec)">token + sandbox</span></h3>
+        <p>A fresh process per allowed call, in its own bwrap namespace, with the governor's decision carried as a signed 5-second token it verifies itself.</p>
+        <ul>
+          <li>Sees its own binary, the governor's public key and two socket files. No interface: the proxy socket is the only way out.</li>
+          <li>Verifies the token's signature, window and binding (tool, target, args hash) before doing anything; exits 2 otherwise.</li>
+          <li>Holds the credential for one call and dies with it.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>Egress <span class="tag" style="background:var(--zone-host)">allow-list</span></h3>
+        <p>Two gates on everything that leaves: a content scan before the decision, and a host allow-list at the wire.</p>
+        <ul>
+          <li>Outbound arguments are scanned for credential shapes and for values the governor itself issued (redaction placeholders, token ids). High and active hits are a hard deny.</li>
+          <li>The proxy verifies the per-call token and checks <code>host:port</code> against the tool's signed <code>egress_hosts</code>. Refusals are logged with tool, task, token id and host.</li>
+          <li>Sensitive inbound fields are redacted to <code>[redacted:tok_…]</code>; the real value comes back only through a human-gated <code>detokenize</code>.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Attestation points</h2>
+    <p class="lede">Each numbered badge on the diagram is an independent verification. Different verifiers, different keys or mechanisms, so no single component vouches for itself.</p>
+    <div class="tablewrap">
+      <table>
+        <thead><tr><th>#</th><th>What is checked</th><th>Who checks</th><th>Against what</th><th>When</th><th>On failure</th></tr></thead>
+        <tbody>
+          <tr><td>1 · Sender identity</td><td>The UID that sent each frame on fd 3</td><td>Governor, per message</td><td>Kernel-stamped <code>SCM_CREDENTIALS</code> vs the expected worker UID (overflow 65534 rejected)</td><td>Every request</td><td class="fail">frame dropped · worker process group killed · audit <code>stop</code></td></tr>
+          <tr><td>2 · Configuration</td><td>Manifest and Cedar policy files</td><td>Governor, secretsd, egress-proxy (each independently)</td><td>Detached Ed25519 <code>.sig</code> vs the operator public key, verified before parse</td><td>Start-up</td><td class="fail">refuses to start</td></tr>
+          <tr><td>3 · Decision → action</td><td>Per-call token: signature, 5 s window, tool / target / args hash</td><td>Executor, offline</td><td>Governor Ed25519 public key; args re-hashed from the bytes received, not trusted from the token</td><td>Before any work</td><td class="fail">exit 2 · nothing runs · audit <code>executor</code> record</td></tr>
+          <tr><td>4 · Credential release</td><td>Same token, plus single use and tool ↔ <code>secret_path</code></td><td>secretsd sidecar</td><td>Governor public key; seen-set of token ids; signed manifest</td><td>Once per call</td><td class="fail">no secret · exit 3 · <code>REFUSED</code> log line</td></tr>
+          <tr><td>5 · Network egress</td><td>Same token, plus <code>host:port</code> on the tool's list</td><td>egress-proxy</td><td>Governor public key; signed manifest <code>egress_hosts</code> (exact string match)</td><td>Every TCP connection</td><td class="fail">HTTP 403 · JSON log (tool, task, jti, host) · exit 4</td></tr>
+          <tr><td>6 · Record integrity</td><td>Every audit record chains to the previous one</td><td><code>agentd verify</code>, the dashboard, an auditor</td><td>SHA-256 of the prior record embedded in each line</td><td>After the fact</td><td class="fail">names the first altered record</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section>
+    <h2>Why the traffic looks like this</h2>
+    <div class="cards">
+      <details open>
+        <summary>Why a Unix socket proxy instead of a network namespace with iptables</summary>
+        <p>A namespace with a REDIRECT rule has routes, an interface and a firewall backend to get right, and a mistake is silent. A sandbox with <em>no</em> interface and one socket file has nothing to misconfigure: Unix sockets are filesystem objects, so they cross the network-namespace boundary while TCP cannot. A reviewer can see the entire egress boundary by listing one directory.</p>
+      </details>
+      <details>
+        <summary>Why the token is checked three times</summary>
+        <p>The executor, the sidecar and the proxy each verify the same signature with the same public key, and each adds its own check (binding, single use, host list). The governor's decision is therefore not a message to be trusted but a capability to be proven, and a forged or replayed request fails at whichever gate it first reaches. The tests cover replay (exit 3), swapped arguments, wrong tool and a rogue signing key (all exit 2).</p>
+      </details>
+      <details>
+        <summary>Why the agent's justification is never an input</summary>
+        <p>Prose is the attack surface. Policy sees only structural facts; the approver sees them first too, and reads the agent's justification only after pressing <code>j</code>. Same facts give the same verdict regardless of what the agent says (test plan M-7).</p>
+      </details>
+      <details>
+        <summary>What is still outside the PoC</summary>
+        <p>The sandbox is as strong as the kernel; production keeps a VM boundary around the host. The proxy sees <code>host:port</code>, not URLs (TLS is opaque to it, which is why the scan runs on the arguments beforehand). Delegation between agents and the MCP bridge are week 5.</p>
+      </details>
+    </div>
+  </section>
+</div>
+
+<script>
+// ---- data ------------------------------------------------------------------
+// Each scenario is a list of steps. A step says which edge the packet rides,
+// which nodes and attestation badges light up, and what to tell the reader.
+// colour: '' (in flight), 'ok', 'deny', 'wait'.
+const S = {
+  allowed: { label: "Allowed call: jira_read OPS-1", steps: [
+    { t: "Worker proposes the call", edge: "e-wg", nodes: ["n-w","n-g"], attest: ["a-uid"],
+      body: "The agent writes one JSON frame to fd 3: tool, args, task id, optional justification. It has no URL to call and no credential to use; proposing is the only thing it can do.",
+      check: "<b>1 · Sender identity.</b> The kernel attaches the sender's UID to the frame. The governor compares it to the worker UID it expects; a mismatch kills the worker." },
+    { t: "Governor validates and decides", nodes: ["n-g"], attest: ["a-sig"],
+      body: "Schema check against the tool's args_schema (enum or pattern bounded; no free text in a resource argument). Then Cedar evaluates principal Agent::\"stub-agent\", action Action::\"jira_read\", resource Target::\"OPS-1\" with the context: call count, taint high-water mark, delegation depth, egress scan level. Verdict: permit.",
+      check: "<b>2 · Configuration.</b> The manifest and policies this decision used were signature-verified at start-up; an unsigned or altered file means the governor never started." },
+    { t: "Token minted, executor spawned", edge: "e-gx", nodes: ["n-g","n-x"], attest: [],
+      body: "The governor signs {jti, tool, target, args_hash, task, exp = now + 5 s} with its Ed25519 key and starts bin/executor -family jira inside bubblewrap, with the token and the arguments on stdin. The executor sandbox has no network interface." },
+    { t: "Executor verifies the token", nodes: ["n-x"], attest: ["a-tok"],
+      body: "Before any work: signature against run/governor.pub, time window, and that the token's tool, target and args hash match what it was actually handed. The hash is recomputed from the received bytes.",
+      check: "<b>3 · Decision → action.</b> A compromised governor or a forged job cannot make an executor act without a key it does not have. Bad token: exit 2, nothing runs." },
+    { t: "Credential released, once", edge: "e-xs", nodes: ["n-x","n-s"], attest: ["a-sec"],
+      body: "The executor presents the same token to secretsd over its Unix socket. The sidecar verifies the signature itself, checks the token id has not been seen, and that this tool maps to this secret_path in the signed manifest. One secret comes back; the governor never saw it.",
+      check: "<b>4 · Credential release.</b> Replaying the token gets REFUSED and exit 3. The secret lives in the executor's memory for one call." },
+    { t: "Egress through the proxy", edge: "e-xp", nodes: ["n-x","n-p"], attest: ["a-prx"],
+      body: "The HTTP client inside the executor dials run/egress.sock and sends CONNECT 127.0.0.1:9811 with Proxy-Authorization: Bearer <token>. There is no other route out of the sandbox.",
+      check: "<b>5 · Network egress.</b> The proxy verifies the token and looks up the token's tool in egress_hosts. 127.0.0.1:9811 is listed for jira_read, so it splices a TCP connection." },
+    { t: "Service answers", edge: "e-pj", nodes: ["n-p","n-j"], attest: [], color: "ok",
+      body: "GET /jira/issue/OPS-1 with the bearer credential and X-Perimeter-Call: <jti>, so the service's own log can be joined to the audit chain. The reply carries the source system's classification (security: \"\" here, \"confidential\" for OPS-99)." },
+    { t: "Result back, redacted and recorded", edge: "e-xg", nodes: ["n-x","n-g","n-a"], attest: ["a-aud"], color: "ok",
+      body: "The executor exits 0 with the result and reported sensitivity. The governor raises task taint to max(manifest floor, reported), replaces the summary field with [redacted:tok_9f2a7c1e] (the value stays in the task store), and appends verdict and executor records to the hash chain.",
+      check: "<b>6 · Record integrity.</b> Each record embeds the SHA-256 of the previous one; agentd verify walks the chain and names the first altered line." },
+    { t: "Reply to the worker", edge: "e-gw", nodes: ["n-g","n-w"], attest: [], color: "ok",
+      body: "The worker receives {ok, result} with the placeholder where the summary was. It can ask for the real value with detokenize, which always needs a human (next scenario but one)." },
+  ]},
+  exfil: { label: "Blocked: post a redacted value to Slack", steps: [
+    { t: "Worker proposes slack_post", edge: "e-wg", nodes: ["n-w","n-g"], attest: ["a-uid"],
+      body: "args: {channel: \"#triage-internal\", text: \"Ticket says: [redacted:tok_9f2a7c1e]\"}. The agent is trying to move something it was not allowed to read into a channel. Sender UID checks out, so the frame is accepted." },
+    { t: "Egress scan: active hit", nodes: ["n-g"], attest: [],
+      body: "slack_post is an outbound tool, so the arguments are scanned before policy. The scanner knows every placeholder and token id the governor has issued; this one matches. Level: active, the strongest. The report names the path ($.text), never the value." },
+    { t: "Cedar: forbid, not overridable", nodes: ["n-g"], attest: ["a-sig"], color: "deny",
+      body: "context.egress_hit == \"active\" fires the base policy egress.active, a plain forbid. Unlike the @verdict(\"approve\") forbids, no human can override it. No token is minted and no executor is spawned; the credential and the network were never in play.",
+      check: "<b>2 · Configuration.</b> The rule that denied this is in a signed file. Changing it means re-signing with a key the host does not hold." },
+    { t: "Recorded and refused", edge: "e-ga", nodes: ["n-g","n-a"], attest: ["a-aud"], color: "deny",
+      body: "Audit: verdict deny, rule egress.active, detail egress_scan=active active_redaction@$.text. The chain holds the path and the rule, not the data, so the audit log cannot become the leak." },
+    { t: "Structured refusal to the worker", edge: "e-gw", nodes: ["n-g","n-w"], attest: [], color: "deny",
+      body: "{denied, reason_code: policy_forbid, rule: egress.active}. The same arguments with an AWS-key-shaped string instead would be a high hit and the same hard deny; a weak signal such as password= is a low hit and goes to a human." },
+  ]},
+  approve: { label: "Human in the loop: detokenize", steps: [
+    { t: "Worker asks for the real value", edge: "e-wg", nodes: ["n-w","n-g"], attest: ["a-uid"],
+      body: "tool detokenize, args {token: \"tok_9f2a7c1e\"}, justification \"I need the summary to decide whether to escalate.\" detokenize is served by the governor itself: no executor, no credential." },
+    { t: "Cedar: approve", nodes: ["n-g"], attest: ["a-sig"], color: "wait",
+      body: "stub.detokenize permits the tool; flow.detokenize is a forbid annotated @verdict(\"approve\"). Because a permit would otherwise match, the verdict is approve rather than deny. The request parks; nothing executes." },
+    { t: "The approver sees facts, not prose", nodes: ["n-g"], attest: [], color: "wait",
+      body: "The terminal prompt shows tool, target, task taint, the rule that fired and the args hash. The agent's justification is hidden until the approver presses j. Sixty seconds without an answer is approval_timeout, a deny.",
+      check: "Same facts, same verdict, whatever the agent wrote. The justification is for the human's curiosity, never for the decision." },
+    { t: "Approved: value from the task store", edge: "e-ga", nodes: ["n-g","n-a"], attest: ["a-aud"], color: "ok",
+      body: "On a, the governor looks the placeholder up in this task's redaction map and answers {token, value}. Audit: approval record with approver id and t_approval_ms, then the executor-equivalent record for the built-in tool. Answering d yields approval_denied and the value never leaves the governor." },
+    { t: "Reply to the worker", edge: "e-gw", nodes: ["n-g","n-w"], attest: [], color: "ok",
+      body: "The worker now holds the summary. If it tries to post that text outbound, the scan sees ordinary prose and policy decides as usual; if it posts the placeholder, it is an active hit again." },
+  ]},
+  bypass: { label: "Going around the governor", steps: [
+    { t: "Worker runs curl directly", edge: "e-wj", nodes: ["n-w","n-j"], attest: [], color: "deny",
+      body: "subprocess curl http://127.0.0.1:9811/log from inside the worker sandbox. bwrap --unshare-all gave this process a network namespace with no interfaces, not even loopback. The connect fails immediately with no route. There is no proxy socket in the worker's view either: only executors get it." },
+    { t: "Worker looks for keys and sockets", nodes: ["n-w"], attest: [], color: "deny",
+      body: "run/governor.key, keys/private, /etc/passwd, /root: all absent. The sandbox root is /usr read-only, the script's own directory, the client library and a private /tmp. Capabilities are dropped, no_new_privs is set, and the seccomp filter returns EPERM for mount, ptrace, unshare, bpf, keyctl and friends." },
+    { t: "Executor dials a host not on the list", edge: "e-xp", nodes: ["n-x","n-p"], attest: ["a-prx"], color: "deny",
+      body: "Suppose a tool family were compromised and tried CONNECT localhost:9811 (or anything else). The token is valid, but egress_hosts for this tool says 127.0.0.1:9811, an exact string. 403, and a log line: {event: refused, tool, task_id, token_id, host: localhost:9811}.",
+      check: "<b>5 · Network egress.</b> The allow-list lives in the signed manifest and is enforced outside the executor's process, by a component that holds no credential of its own." },
+    { t: "Executor tries to reuse a token", edge: "e-xs", nodes: ["n-x","n-s"], attest: ["a-sec"], color: "deny",
+      body: "A captured token replayed to the sidecar: already used, REFUSED, exit 3. Swapped arguments, another tool or a rogue signing key fail earlier, at the executor's own check, exit 2. Five seconds later the token is dead regardless." },
+    { t: "Everything was recorded", edge: "e-ga", nodes: ["n-g","n-a"], attest: ["a-aud"], color: "deny",
+      body: "Each refusal leaves a record somewhere an operator reads: the audit chain for verdicts and executor exits, the proxy log for egress, the sidecar log for credentials. The dashboard tails all three and flags the pattern as a behavioural anomaly, observationally; it never feeds policy." },
+  ]},
+};
+
+const INFO = {
+  worker: "The agent. Runs as its own UID with three environment variables and one inherited file descriptor. Under -sandbox bwrap it has no network interface, a read-only /usr, its script directory and a private /tmp. It is assumed hostile.",
+  governor: "agentd. Verifies signed manifest and policies at start, authenticates every frame by sender UID, validates arguments against a schema, scans outbound arguments, evaluates Cedar, mints per-call tokens, redacts inbound fields, and writes the audit chain. Holds no service credential.",
+  audit: "Append-only JSONL where each record carries the SHA-256 of the previous one. Records: start, verdict, approval, executor, stop, with request id, timings, target, token id, approver id. agentd verify checks the chain.",
+  secretsd: "Operator-started sidecar on a 0600 Unix socket. Verifies the per-call token with the governor public key, enforces single use, maps tool to secret_path from the signed manifest, releases one secret. Backend: a file or Vault KV v2 via AppRole.",
+  proxy: "egress-proxy on a Unix socket. Accepts only CONNECT host:port with Proxy-Authorization: Bearer <token>; verifies the token and checks host:port against the tool's egress_hosts in the signed manifest; splices TCP or returns 403 and a JSON log line.",
+  executor: "One process per allowed call, in its own bwrap sandbox with no interface. Verifies the token offline, fetches one credential, talks to the service through the proxy, reports result and the source's classification, exits. Families (jira, slack, echo) are the only code that knows a service's API.",
+  service: "The real system of record. In the PoC a mock Jira/Slack with bearer auth and a request log; each request carries X-Perimeter-Call: <jti> so the service log joins to the audit chain.",
+};
+
+// ---- state & rendering -------------------------------------------------------
+let scen = "allowed", idx = 0, timer = null, anim = null;
+const $ = (s) => document.querySelector(s);
+const packet = $("#packet");
+
+function render() {
+  const steps = S[scen].steps, st = steps[idx];
+  // scenario buttons
+  document.querySelectorAll("#scenarios button").forEach(b => b.setAttribute("aria-pressed", b.dataset.k === scen));
+  // step list
+  $("#steps").innerHTML = steps.map((s, i) =>
+    `<li class="${i === idx ? "cur" : i < idx ? "done" : ""}" data-i="${i}"><span class="n">${i + 1}</span><span>${s.t}</span></li>`).join("");
+  $("#count").textContent = `${idx + 1} / ${steps.length}`;
+  $("#prev").disabled = idx === 0;
+  $("#next").disabled = idx === steps.length - 1;
+  // detail
+  const pill = st.color === "ok" ? `<span class="pill ok">allowed</span>` : st.color === "deny" ? `<span class="pill deny">refused</span>` :
+               st.color === "wait" ? `<span class="pill wait">waiting on a human</span>` : `<span class="pill">in flight</span>`;
+  $("#detail").innerHTML = `<h3>${pill} ${st.t}</h3><p>${st.body}</p>${st.check ? `<div class="check">${st.check}</div>` : ""}`;
+  // diagram highlights
+  document.querySelectorAll(".node").forEach(n => n.classList.remove("active", "ok", "deny"));
+  document.querySelectorAll(".edge").forEach(e => e.classList.remove("lit", "ok", "deny"));
+  document.querySelectorAll(".attest").forEach(a => a.classList.remove("lit"));
+  const cls = st.color === "ok" ? "ok" : st.color === "deny" ? "deny" : "active";
+  st.nodes.forEach(id => document.getElementById(id).classList.add(cls));
+  st.attest.forEach(id => document.getElementById(id).classList.add("lit"));
+  packet.className.baseVal = st.color || "";
+  if (st.edge) {
+    const e = document.getElementById(st.edge);
+    e.classList.add("lit", st.color === "ok" ? "ok" : st.color === "deny" ? "deny" : "x");
+    movePacket(e);
+  } else {
+    // park on the first lit node
+    const r = document.getElementById(st.nodes[0]).querySelector("rect");
+    packet.setAttribute("cx", +r.getAttribute("x") + +r.getAttribute("width") / 2);
+    packet.setAttribute("cy", +r.getAttribute("y") + +r.getAttribute("height") / 2 - 26);
+    packet.setAttribute("opacity", 1);
+  }
+}
+
+// Slide the packet along an SVG path using getPointAtLength.
+function movePacket(path) {
+  if (anim) cancelAnimationFrame(anim);
+  const len = path.getTotalLength();
+  const reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
+  const dur = reduce ? 0 : 900;
+  const t0 = performance.now();
+  packet.setAttribute("opacity", 1);
+  const frame = (now) => {
+    const p = dur ? Math.min(1, (now - t0) / dur) : 1;
+    const pt = path.getPointAtLength(len * (p < .5 ? 2 * p * p : -1 + (4 - 2 * p) * p)); // ease in-out
+    packet.setAttribute("cx", pt.x); packet.setAttribute("cy", pt.y);
+    if (p < 1) anim = requestAnimationFrame(frame);
+  };
+  anim = requestAnimationFrame(frame);
+}
+
+function go(i) { idx = Math.max(0, Math.min(S[scen].steps.length - 1, i)); render(); }
+function stopPlay() { if (timer) { clearInterval(timer); timer = null; $("#play").textContent = "▶ Play"; } }
+
+// ---- wiring ------------------------------------------------------------------
+$("#scenarios").innerHTML = Object.entries(S).map(([k, v]) =>
+  `<button type="button" data-k="${k}" aria-pressed="false">${v.label}</button>`).join("");
+$("#scenarios").addEventListener("click", (e) => {
+  const b = e.target.closest("button"); if (!b) return;
+  stopPlay(); scen = b.dataset.k; idx = 0; render();
+});
+$("#steps").addEventListener("click", (e) => { const li = e.target.closest("li"); if (li) { stopPlay(); go(+li.dataset.i); } });
+$("#prev").addEventListener("click", () => { stopPlay(); go(idx - 1); });
+$("#next").addEventListener("click", () => { stopPlay(); go(idx + 1); });
+$("#play").addEventListener("click", () => {
+  if (timer) return stopPlay();
+  if (idx === S[scen].steps.length - 1) idx = -1;
+  $("#play").textContent = "⏸ Pause";
+  go(idx + 1);
+  timer = setInterval(() => { if (idx >= S[scen].steps.length - 1) stopPlay(); else go(idx + 1); }, 2600);
+});
+document.addEventListener("keydown", (e) => {
+  if (e.target.tagName === "BUTTON" || e.target.tagName === "INPUT") return;
+  if (e.key === "ArrowRight") { stopPlay(); go(idx + 1); }
+  if (e.key === "ArrowLeft") { stopPlay(); go(idx - 1); }
+});
+// Clicking a component explains it in the detail pane without changing the step.
+const showInfo = (n) => {
+  const name = n.querySelector("text").textContent;
+  $("#detail").innerHTML = `<h3><span class="pill attest">component</span> ${name}</h3><p>${INFO[n.dataset.info]}</p><p style="color:var(--muted);font-size:.8rem">Use Back / Next to return to the walkthrough.</p>`;
+};
+document.querySelectorAll(".node").forEach(n => {
+  n.addEventListener("click", () => showInfo(n));
+  n.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); showInfo(n); } });
+});
+render();
+</script>
