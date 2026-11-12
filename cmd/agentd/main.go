@@ -15,6 +15,10 @@ import (
 func generateGovKey() (ed25519.PublicKey, ed25519.PrivateKey, error) { return tokens.GenerateKey() }
 func fingerprint(pub ed25519.PublicKey) string                       { return tokens.Fingerprint(pub) }
 
+// version is stamped by the release workflow (-ldflags "-X main.version=v0.4.0");
+// a local build reports "dev".
+var version = "dev"
+
 func main() {
 	if len(os.Args) < 2 {
 		usage()
@@ -28,6 +32,9 @@ func main() {
 		err = cmdVerify(os.Args[2:])
 	case "keygen":
 		err = cmdKeygen(os.Args[2:])
+	case "version":
+		fmt.Println("agentd", version)
+		return
 	case "-h", "--help", "help":
 		usage()
 		return
@@ -45,6 +52,7 @@ func main() {
 func usage() {
 	fmt.Fprintln(os.Stderr, `usage:
   agentd keygen -out run/governor.key                      (once; also writes run/governor.pub)
+  agentd version
   agentd run -manifest M.json -pubkey K.pub -policies DIR -audit LOG.jsonl -gov-key run/governor.key
              [-worker-user U] [-executor BIN] [-secrets-sock SOCK] [-approver cli|deny] [-dry-run] [-kill-dir DIR] -- CMD [ARGS...]
   agentd verify -audit LOG.jsonl`)

@@ -1,0 +1,89 @@
+# Release: pushing a tag v* builds every binary for linux/amd64 and
+# linux/arm64 from the committed vendor/ directory, bundles each platform
+# with the manifests, policies, deploy files and docs, writes SHA256SUMS,
+# signs every file with Sigstore (keyless, tied to this workflow's identity),
+# attaches an SBOM, and publishes a GitHub Release.
+#
+# Static binaries: CGO_ENABLED=0 -trimpath, so the same source and toolchain
+# produce the same bytes. Air-gapped sites can verify SHA256SUMS against a
+# build of their own instead of trusting the download.
+name: release
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write    # create the release
+  id-token: write    # Sigstore keyless signing
+
+env:
+  GOFLAGS: -mod=vendor
+  CGO_ENABLED: "0"
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Test before anything ships
+        run: go test -race -count=1 ./...
+
+      - name: Cross-compile
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME}"
+          for arch in amd64 arm64; do
+            out="dist/agent-perimeter-${VERSION}-linux-${arch}"
+            mkdir -p "$out/bin"
+            for cmd in agentd executor secretsd egress-proxy mockserv auditview sign-manifest; do
+              GOOS=linux GOARCH=$arch go build -trimpath \
+                -ldflags "-s -w -X main.version=${VERSION}" \
+                -o "$out/bin/$cmd" "./cmd/$cmd"
+            done
+            cp -r manifests policies deploy docs client agents Makefile README.md LICENSE* "$out/" 2>/dev/null || true
+            tar -C dist -czf "$out.tar.gz" "$(basename "$out")"
+            rm -r "$out"
+          done
+          (cd dist && sha256sum *.tar.gz > SHA256SUMS)
+          ls -la dist
+
+      - name: Sigstore keyless signatures
+        uses: sigstore/cosign-installer@v3
+      - run: |
+          set -euo pipefail
+          cd dist
+          for f in *.tar.gz SHA256SUMS; do
+            cosign sign-blob --yes "$f" --bundle "$f.sigstore.json"
+          done
+
+      - name: SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          path: .
+          format: spdx-json
+          output-file: dist/agent-perimeter-${{ github.ref_name }}.spdx.json
+          upload-artifact: false
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          body: |
+            Static Linux binaries (amd64, arm64) for agentd and its companions, built from the committed `vendor/` directory with `CGO_ENABLED=0 -trimpath`.
+
+            **Verify**
+            ```
+            sha256sum -c SHA256SUMS --ignore-missing
+            cosign verify-blob SHA256SUMS --bundle SHA256SUMS.sigstore.json \
+              --certificate-identity-regexp 'https://github.com/${{ github.repository }}/' \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com
+            ```
+            Air-gapped sites: rebuild with `make build` from the tagged source and compare `SHA256SUMS`.
+
+            Start with `docs/DEPLOY.md`. Requires `bubblewrap` on the host for `-sandbox bwrap`.

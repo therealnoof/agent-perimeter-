@@ -1,0 +1,30 @@
+# CI: every push and pull request builds from the committed vendor/ directory
+# (no module downloads) and runs the full test suite with the race detector.
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod   # 1.26, the floor cedar-go needs
+          cache: false              # nothing to cache: builds are -mod=vendor
+      - name: Build (vendored, no network)
+        run: make build
+        env:
+          GOFLAGS: -mod=vendor
+      - name: Test
+        run: make test
+        env:
+          GOFLAGS: -mod=vendor
+      - name: gofmt
+        run: test -z "$(gofmt -l cmd internal)" || { gofmt -l cmd internal; exit 1; }

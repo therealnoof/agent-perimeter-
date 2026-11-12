@@ -34,6 +34,25 @@ Check it:
 
 Every line should read `PASS`. `WARN` lines about docker, iptables and opa are fine until those weeks arrive.
 
+## 2a. Install from a release (no Go toolchain needed)
+
+Tagged releases carry static binaries for `linux/amd64` and `linux/arm64`, built by `.github/workflows/release.yml` from the committed `vendor/` directory.
+
+```bash
+V=v0.4.0; A=amd64
+curl -LO https://github.com/therealnoof/agent-perimeter-/releases/download/$V/agent-perimeter-$V-linux-$A.tar.gz
+curl -LO https://github.com/therealnoof/agent-perimeter-/releases/download/$V/SHA256SUMS
+curl -LO https://github.com/therealnoof/agent-perimeter-/releases/download/$V/SHA256SUMS.sigstore.json
+sha256sum -c SHA256SUMS --ignore-missing
+cosign verify-blob SHA256SUMS --bundle SHA256SUMS.sigstore.json \
+  --certificate-identity-regexp 'https://github.com/therealnoof/agent-perimeter-/' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+tar xzf agent-perimeter-$V-linux-$A.tar.gz && cd agent-perimeter-$V-linux-$A
+bin/agentd version
+```
+
+The tarball has the same layout as the repo (`bin/`, `manifests/`, `policies/`, `deploy/`, `docs/`, `Makefile`), so every later step is identical. Air-gapped sites: build from the tagged source with `make build` and compare your `sha256sum bin/*` against the release's; the build is reproducible (`CGO_ENABLED=0 -trimpath`, no module downloads). Cutting a release is `git tag -a vX.Y.Z -m "..." && git push origin vX.Y.Z`.
+
 ## 2. Get and build the code
 
 ```bash
